@@ -1,0 +1,62 @@
+pluginManagement {
+  def reactNativeGradlePlugin = new File(
+    providers.exec {
+      workingDir(rootDir)
+      commandLine("node", "--print", "require.resolve('@react-native/gradle-plugin/package.json', { paths: [require.resolve('react-native/package.json')] })")
+    }.standardOutput.asText.get().trim()
+  ).getParentFile().absolutePath
+  includeBuild(reactNativeGradlePlugin)
+  
+  def expoPluginsPath = new File(
+    providers.exec {
+      workingDir(rootDir)
+      commandLine("node", "--print", "require.resolve('expo-modules-autolinking/package.json', { paths: [require.resolve('expo/package.json')] })")
+    }.standardOutput.asText.get().trim(),
+    "../android/expo-gradle-plugin"
+  ).absolutePath
+  includeBuild(expoPluginsPath)
+}
+
+plugins {
+  id("com.facebook.react.settings")
+  id("expo-autolinking-settings")
+}
+
+extensions.configure(com.facebook.react.ReactSettingsExtension) { ex ->
+  if (System.getenv('EXPO_USE_COMMUNITY_AUTOLINKING') == '1') {
+    ex.autolinkLibrariesFromCommand()
+  } else {
+    ex.autolinkLibrariesFromCommand(expoAutolinking.rnConfigCommand)
+  }
+}
+expoAutolinking.useExpoModules()
+
+rootProject.name = 'MeshLink'
+
+expoAutolinking.useExpoVersionCatalog()
+
+include ':app'
+includeBuild(expoAutolinking.reactNativeGradlePlugin)
+
+// The Android SDK's bundled Ninja cannot reliably stat deeply nested Prefab
+// files near MAX_PATH. The helper build script supplies a temporary short root.
+def meshLinkShortRoot = System.getenv('MESHLINK_SHORT_PROJECT_ROOT')
+if (meshLinkShortRoot) {
+  gradle.settingsEvaluated { settings ->
+    def shortNodeModules = new File(meshLinkShortRoot, 'node_modules')
+    def nodeModulesMarker = File.separator + 'node_modules' + File.separator
+
+    def remapNodeModuleProjects
+    remapNodeModuleProjects = { descriptor ->
+      def physicalProjectDir = descriptor.projectDir.canonicalFile
+      def markerIndex = physicalProjectDir.path.toLowerCase().lastIndexOf(nodeModulesMarker)
+      if (markerIndex >= 0) {
+        def relativePath = physicalProjectDir.path.substring(markerIndex + nodeModulesMarker.length())
+        descriptor.projectDir = new File(shortNodeModules, relativePath)
+      }
+      descriptor.children.each { child -> remapNodeModuleProjects(child) }
+    }
+
+    remapNodeModuleProjects(settings.rootProject)
+  }
+}
