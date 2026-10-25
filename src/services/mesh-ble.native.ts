@@ -22,6 +22,7 @@ import type {
   MeshBleAdapter,
   PacketHandler,
 } from "./mesh-ble.types";
+import { SerialTaskQueue } from "@/lib/serial-task-queue";
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -40,6 +41,7 @@ class NativeMeshBleService implements MeshBleAdapter {
   private device: Device | null = null;
   private monitorSubscription: Subscription | null = null;
   private disconnectSubscription: Subscription | null = null;
+  private writes = new SerialTaskQueue();
 
   async requestPermissions(): Promise<boolean> {
     if (Platform.OS !== "android") return true;
@@ -182,24 +184,20 @@ class NativeMeshBleService implements MeshBleAdapter {
     this.device = null;
   }
 
-  async writeJson(payload: object): Promise<void> {
+  async writeJson(payload: object, beforeStart?: () => void): Promise<void> {
     if (!this.device) throw new Error("No hay ningún nodo LoRa conectado.");
-
-    const commandBytes = new TextEncoder().encode(
-      `${JSON.stringify(payload)}\n`,
-    );
-    for (
-      let offset = 0;
-      offset < commandBytes.length;
-      offset += BLE_CHUNK_BYTES
-    ) {
-      const chunk = commandBytes.slice(offset, offset + BLE_CHUNK_BYTES);
-      await this.device.writeCharacteristicWithResponseForService(
-        BLE_SERVICE_UUID,
-        BLE_TX_UUID,
-        bytesToBase64(chunk),
-      );
-    }
+    const device = this.device;
+    const commandBytes = new TextEncoder().encode(`${JSON.stringify(payload)}\n`);
+    return this.writes.run(async () => {
+      beforeStart?.(); // Recheck consent/key/cancellation after waiting in the BLE queue.
+      for (let offset = 0; offset < commandBytes.length; offset += BLE_CHUNK_BYTES) {
+        if (this.device !== device) throw new Error("La conexión del nodo cambió. Vuelve a intentar.");
+        const chunk = commandBytes.slice(offset, offset + BLE_CHUNK_BYTES);
+        await device.writeCharacteristicWithResponseForService(
+          BLE_SERVICE_UUID, BLE_TX_UUID, bytesToBase64(chunk),
+        );
+      }
+    });
   }
 }
 

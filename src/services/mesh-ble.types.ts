@@ -20,6 +20,6 @@ export interface MeshBleAdapter {
     onDisconnect: DisconnectHandler,
   ): Promise<ConnectedDevice>;
   disconnect(): Promise<void>;
-  writeJson(payload: object): Promise<void>;
+  writeJson(payload: object, beforeStart?: () => void): Promise<void>;
 }
 

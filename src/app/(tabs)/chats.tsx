@@ -1,4 +1,5 @@
 import { Ionicons } from "@expo/vector-icons";
+import { decodeHealthShare } from "@/lib/health-share";
 import { router } from "expo-router";
 import {
   FlatList,
@@ -18,7 +19,8 @@ import type { ConversationSummary } from "@/types/mesh";
 
 function ConversationRow({ item }: { item: ConversationSummary }) {
   const isBroadcast = item.id === BROADCAST_ID;
-  const preview = item.latest?.text ?? (isBroadcast ? "Llega a todos los nodos cercanos" : "Aún no hay mensajes");
+  const preview = item.latest && decodeHealthShare(item.latest.text) ? "Informe de apoyo · MAX30102" :
+    item.latest?.text ?? (isBroadcast ? "Llega a todos los nodos cercanos" : "Aún no hay mensajes");
 
   return (
     <TouchableOpacity

@@ -8,6 +8,8 @@ import type {
 const DEMO_ID = "demo-lora-node";
 
 class WebDemoMeshBleService implements MeshBleAdapter {
+  private bootId = "DE000000000000000000000000000001";
+  private startedAt = Date.now();
   private connected = false;
   private onPacket: PacketHandler | null = null;
   private onDisconnect: DisconnectHandler | null = null;
@@ -47,6 +49,9 @@ class WebDemoMeshBleService implements MeshBleAdapter {
         nodeName: "Nodo Demo",
         layer: "5.1",
         radio: "SX1262-RadioLib",
+        firmwareVersion: "5.4.0-DEMO",
+        board: "SIMULATED",
+        requestCorrelation: true,
       });
       this.emitDemoNodes();
       this.emit({
@@ -103,7 +108,8 @@ class WebDemoMeshBleService implements MeshBleAdapter {
     this.onDisconnect?.();
   }
 
-  async writeJson(payload: Record<string, unknown>) {
+  async writeJson(payload: Record<string, unknown>, beforeStart?: () => void) {
+    beforeStart?.();
     if (!this.connected) throw new Error("El nodo de demostración está desconectado.");
 
     if (["info", "status", "nodes"].includes(String(payload.cmd))) {
@@ -139,6 +145,7 @@ class WebDemoMeshBleService implements MeshBleAdapter {
             to,
             bytes: 142,
             encrypted: Boolean(payload.payload),
+            requestId: payload.requestId,
           }),
         250,
       );
@@ -160,7 +167,9 @@ class WebDemoMeshBleService implements MeshBleAdapter {
   }
 
   private emit(packet: FirmwarePacket) {
-    this.onPacket?.(packet);
+    if (!this.connected) return;
+    this.onPacket?.({ ...packet, nodeId: "N-DEMO00000001", bootId: this.bootId,
+      uptimeMs: Date.now() - this.startedAt, metricsEpoch: 0, demo: true });
   }
 }
 

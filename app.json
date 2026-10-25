@@ -2,7 +2,7 @@
   "expo": {
     "name": "MeshLink",
     "slug": "lora-mesh-app",
-    "version": "1.0.0",
+    "version": "1.4.1",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "scheme": "lorameshapp",
@@ -18,6 +18,7 @@
     },
     "android": {
       "package": "com.yohamin.meshlink",
+      "versionCode": 11,
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",

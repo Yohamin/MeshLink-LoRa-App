@@ -29,26 +29,56 @@ try {
     Set-Location -LiteralPath $androidRoot
 
     $env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'
+    $env:ANDROID_HOME = 'C:\Users\Yohamin\AppData\Local\Android\Sdk'
+    $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
     $env:NODE_ENV = 'production'
     $env:ORG_GRADLE_PROJECT_reactNativeArchitectures = 'arm64-v8a'
     $env:MESHLINK_SHORT_PROJECT_ROOT = $mappedProjectRoot
 
-    # Remove generated native caches so release CMake files contain only the
-    # short M: paths. Gradle recreates these directories during the build.
-    $cxxCachePaths = @(
+    # A restricted filesystem can make Expo report an empty dependency list
+    # with exit code 0. React Native otherwise caches that as a valid config.
+    $autolinkingCli = "$mappedProjectRoot\node_modules\expo-modules-autolinking\bin\expo-modules-autolinking.js"
+    $preflightErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $nativeConfigLines = & node $autolinkingCli react-native-config --platform android --json --project-root $mappedProjectRoot
+        $nativeConfigExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $preflightErrorPreference
+    }
+    if ($nativeConfigExitCode -ne 0) {
+        throw 'Android module discovery failed. Run this script in your regular Windows PowerShell terminal.'
+    }
+    $nativeConfig = ($nativeConfigLines -join "`n") | ConvertFrom-Json
+    foreach ($requiredModule in @('react-native-worklets', 'react-native-reanimated', 'react-native-ble-plx')) {
+        $moduleProperty = $nativeConfig.dependencies.PSObject.Properties[$requiredModule]
+        if (-not $moduleProperty -or -not $moduleProperty.Value.platforms.android.sourceDir) {
+            throw "Android module discovery did not find $requiredModule. Check Node filesystem access (EPERM) and run this script in your regular Windows PowerShell terminal."
+        }
+    }
+    Write-Host 'Android module discovery: Worklets, Reanimated and Bluetooth found.' -ForegroundColor Green
+
+    # Recreate native and autolinking caches, including an empty config left by
+    # an earlier restricted build. Never remove app data or source files.
+    $generatedCachePaths = @(
         "$mappedProjectRoot\android\app\.cxx",
         "$mappedProjectRoot\node_modules\expo-modules-core\android\.cxx",
         "$mappedProjectRoot\node_modules\react-native-worklets\android\.cxx",
-        "$mappedProjectRoot\node_modules\react-native-reanimated\android\.cxx"
+        "$mappedProjectRoot\node_modules\react-native-reanimated\android\.cxx",
+        "$mappedProjectRoot\android\build\generated\autolinking"
     )
     $mappedProjectPrefix = [System.IO.Path]::GetFullPath("$mappedProjectRoot\")
-    foreach ($cxxCachePath in $cxxCachePaths) {
-        $resolvedCachePath = [System.IO.Path]::GetFullPath($cxxCachePath)
+    foreach ($generatedCachePath in $generatedCachePaths) {
+        $resolvedCachePath = [System.IO.Path]::GetFullPath($generatedCachePath)
         if (-not $resolvedCachePath.StartsWith($mappedProjectPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "Refusing to remove a CMake cache outside the mapped project: $resolvedCachePath"
+            throw "Refusing to remove a generated cache outside the mapped project: $resolvedCachePath"
         }
         if (Test-Path -LiteralPath $resolvedCachePath) {
-            Write-Host "Removing generated CMake cache: $resolvedCachePath"
+            if ((Get-Item -LiteralPath $resolvedCachePath).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Refusing to remove a linked cache: $resolvedCachePath"
+            }
+            Write-Host "Removing generated build cache: $resolvedCachePath"
             Remove-Item -LiteralPath $resolvedCachePath -Recurse -Force
         }
     }

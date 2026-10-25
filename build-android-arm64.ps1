@@ -30,6 +30,8 @@ try {
     Set-Location -LiteralPath $androidRoot
 
     $env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'
+    $env:ANDROID_HOME = 'C:\Users\Yohamin\AppData\Local\Android\Sdk'
+    $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
     $env:NODE_ENV = 'development'
     $env:ORG_GRADLE_PROJECT_reactNativeArchitectures = 'arm64-v8a'
     $env:MESHLINK_SHORT_PROJECT_ROOT = $mappedProjectRoot

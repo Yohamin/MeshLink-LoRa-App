@@ -17,7 +17,11 @@ import {
   ENCRYPTED_TEXT_LIMIT,
   PLAIN_TEXT_LIMIT,
 } from "@/constants/mesh";
-import { decryptMessage, encryptMessage } from "@/lib/crypto";
+import {
+  decryptMessage,
+  encryptMessage,
+  type CryptoOperationMetrics,
+} from "@/lib/crypto";
 import {
   clearStoredMessages,
   loadMessages,
@@ -28,6 +32,13 @@ import {
   saveSettings,
 } from "@/lib/storage";
 import { utf8Length } from "@/lib/text";
+import { gpsSosText, normalizeGps, type NodeGps } from "@/lib/gps";
+import { normalizeHealth, type NodeHealth } from "@/lib/health";
+import { assertHealthTransport, decodeHealthShare } from "@/lib/health-share";
+import { useFieldTests } from "@/hooks/use-field-tests";
+import type { MetricArchive, MetricSession } from "@/lib/telemetry";
+import type { TrialView } from "@/lib/trial-coordinator";
+import type { TestProgress } from "@/lib/test-runner";
 import { meshBleService } from "@/services/mesh-ble";
 import type {
   ConnectedDevice,
@@ -42,7 +53,12 @@ import type {
 } from "@/types/mesh";
 
 type SendOptions = {
+  sensitive?: boolean;
+  sendSignal?: AbortSignal;
+  notAfter?: number;
   sos?: boolean;
+  requestId?: string;
+  testSignal?: AbortSignal;
 };
 
 type MeshContextValue = {
@@ -53,6 +69,11 @@ type MeshContextValue = {
   nodeInfo: NodeInfo | null;
   nodes: MeshNode[];
   status: MeshStatus | null;
+  gps: NodeGps | null;
+  setNodeGpsEnabled: (enabled: boolean) => Promise<void>;
+  health: NodeHealth | null;
+  subscribeHealth: (listener: (health: NodeHealth) => void) => () => void;
+  setNodeHealthEnabled: (enabled: boolean) => Promise<void>;
   messages: MeshMessage[];
   conversations: ConversationSummary[];
   networkKey: string;
@@ -74,6 +95,16 @@ type MeshContextValue = {
   updateNetworkKey: (key: string) => Promise<void>;
   setEncryptionEnabled: (enabled: boolean) => Promise<void>;
   clearHistory: () => Promise<void>;
+  metricSessions: MetricSession[];
+  metricSessionId: string | null;
+  metricError: string | null;
+  metricsReady: boolean;
+  testProgress: TestProgress | null;
+  startTest: (destination: string, scenario: string, intervalMs: number) => Promise<TestProgress | undefined>;
+  cancelTest: () => void;
+  metricArchive: (id: string) => Promise<MetricArchive>;
+  trialState: TrialView;
+  setTrialMode: (enabled: boolean) => void;
 };
 
 const MeshContext = createContext<MeshContextValue | null>(null);
@@ -120,15 +151,64 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
   const [nodeInfo, setNodeInfo] = useState<NodeInfo | null>(null);
   const [nodes, setNodes] = useState<MeshNode[]>([]);
   const [status, setStatus] = useState<MeshStatus | null>(null);
+  const [gps, setGps] = useState<NodeGps | null>(null);
+  const [health, setHealth] = useState<NodeHealth | null>(null);
+  const healthListeners = useRef(new Set<(health: NodeHealth) => void>());
+  const subscribeHealth = useCallback((listener: (health: NodeHealth) => void) => {
+    healthListeners.current.add(listener);
+    return () => { healthListeners.current.delete(listener); };
+  }, []);
+  const healthRequests = useRef(new Map<string, {
+    nodeId: string;
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>());
+  const gpsRequests = useRef(new Map<string, {
+    nodeId: string;
+    resolve: (gps: NodeGps) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>());
+
+  const clearGps = useCallback(() => {
+    setGps(null);
+    setHealth(null);
+    for (const pending of healthRequests.current.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Se desconectó el nodo mientras configurábamos el sensor."));
+    }
+    healthRequests.current.clear();
+    for (const pending of gpsRequests.current.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Se desconectó el nodo mientras consultábamos el GPS."));
+    }
+    gpsRequests.current.clear();
+  }, []);
   const [messages, setMessages] = useState<MeshMessage[]>([]);
   const [networkKey, setNetworkKey] = useState(DEMO_NETWORK_KEY);
   const [encryptionEnabled, setEncryptionEnabledState] = useState(true);
+  const encryptionEnabledRef = useRef(true);
+  encryptionEnabledRef.current = encryptionEnabled;
   const [lastError, setLastError] = useState<string | null>(null);
 
   const messagesRef = useRef<MeshMessage[]>([]);
   const networkKeyRef = useRef(DEMO_NETWORK_KEY);
   const outgoingQueue = useRef<string[]>([]);
+  const incomingMessages = useRef<Promise<void>>(Promise.resolve());
   const scanTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const transmitRef = useRef<(to: string, text: string, requestId: string, signal: AbortSignal) => Promise<void>>(async () => {
+    throw new Error("El envío aún no está listo.");
+  });
+  const transmitTest = useCallback((to: string, text: string, requestId: string, signal: AbortSignal) =>
+    transmitRef.current(to, text, requestId, signal), []);
+  const fieldTests = useFieldTests(transmitTest);
+  const fieldTestsRef = useRef(fieldTests);
+  fieldTestsRef.current = fieldTests;
+  fieldTests.updateLink({ connected: connectionState === "connected", demo: connectedDevice?.isDemo === true,
+    encrypted: encryptionEnabled,
+    correlation: nodeInfo?.requestCorrelation === true, nodeId: nodeInfo?.nodeId ?? "",
+    idle: !messages.some(m => m.direction === "outgoing" && ["queued", "sent"].includes(m.status) && !m.broadcast) });
 
   const replaceMessages = useCallback(
     (updater: (current: MeshMessage[]) => MeshMessage[]) => {
@@ -149,8 +229,10 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
         loadNetworkKey(),
         loadSettings(),
       ]);
-      messagesRef.current = storedMessages;
-      setMessages(storedMessages);
+      const restored = storedMessages.map(m => m.direction === "outgoing" && ["queued", "sent"].includes(m.status)
+        ? { ...m, status: "unconfirmed" as const } : m);
+      messagesRef.current = restored;
+      setMessages(restored);
       const key = storedKey || DEMO_NETWORK_KEY;
       networkKeyRef.current = key;
       setNetworkKey(key);
@@ -164,18 +246,36 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
 
     return () => {
       if (scanTimer.current) clearTimeout(scanTimer.current);
+      for (const pending of gpsRequests.current.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("Se cerró la sesión GPS."));
+      }
+      gpsRequests.current.clear();
+      for (const pending of healthRequests.current.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error("Se cerró la sesión del sensor."));
+      }
+      healthRequests.current.clear();
       void meshBleService.stopScan();
     };
   }, []);
 
   const handlePacket = useCallback(
     async (packet: FirmwarePacket) => {
+      fieldTestsRef.current.receive(packet);
       if (packet.type === "info" || packet.type === "ready") {
         setNodeInfo((current) => ({
           nodeId: asString(packet.nodeId, current?.nodeId ?? ""),
           nodeName: asString(packet.nodeName, current?.nodeName ?? "Nodo LoRa"),
           layer: asString(packet.layer, current?.layer),
           radio: asString(packet.radio, current?.radio),
+          board: asString(packet.board, current?.board),
+          firmwareVersion: asString(packet.firmwareVersion, current?.firmwareVersion),
+          gpsSupported: typeof packet.gpsSupported === "boolean" ? packet.gpsSupported : current?.gpsSupported,
+          healthSupported: typeof packet.healthSupported === "boolean" ? packet.healthSupported : current?.healthSupported,
+          bootId: asString(packet.bootId, current?.bootId),
+          requestCorrelation: packet.requestCorrelation === true || current?.requestCorrelation === true,
+          snapshotCorrelation: packet.snapshotCorrelation === true || current?.snapshotCorrelation === true,
         }));
         return;
       }
@@ -189,6 +289,33 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
                 nodeName: asString(packet.nodeName, "Nodo LoRa"),
               },
         );
+        return;
+      }
+
+      if (packet.type === "gps") {
+        const next = normalizeGps(packet);
+        setGps(next);
+        const id = asString(packet.requestId);
+        const pending = gpsRequests.current.get(id);
+        if (pending && pending.nodeId === asString(packet.nodeId)) {
+          clearTimeout(pending.timer);
+          gpsRequests.current.delete(id);
+          pending.resolve(next);
+        }
+        return;
+      }
+
+      if (packet.type === "health") {
+        const next = normalizeHealth(packet);
+        setHealth(next);
+        for (const listener of healthListeners.current) listener(next);
+        const id = asString(packet.requestId);
+        const pending = healthRequests.current.get(id);
+        if (pending && pending.nodeId === asString(packet.nodeId)) {
+          clearTimeout(pending.timer);
+          healthRequests.current.delete(id);
+          pending.resolve();
+        }
         return;
       }
 
@@ -224,8 +351,10 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
       }
 
       if (packet.type === "sent") {
-        const queuedId = outgoingQueue.current.shift();
-        if (!queuedId) return;
+        const requestId = asString(packet.requestId);
+        const queuedId = requestId || outgoingQueue.current[0];
+        outgoingQueue.current = outgoingQueue.current.filter(id => id !== queuedId);
+        if (!queuedId || !messagesRef.current.some(m => m.id === queuedId)) return;
         replaceMessages((current) =>
           current.map((message) =>
             message.id === queuedId
@@ -243,6 +372,7 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
 
       if (packet.type === "ack") {
         const ackFor = asString(packet.ackFor);
+        if (!messagesRef.current.some(m => m.firmwareId === ackFor)) return;
         replaceMessages((current) =>
           current.map((message) =>
             message.firmwareId === ackFor
@@ -250,14 +380,15 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
               : message,
           ),
         );
-        await Haptics.notificationAsync(
+        if (!fieldTestsRef.current.running()) void Haptics.notificationAsync(
           Haptics.NotificationFeedbackType.Success,
-        );
+        ).catch(() => {});
         return;
       }
 
       if (packet.type === "ackTimeout") {
         const msgId = asString(packet.msgId);
+        if (!messagesRef.current.some(m => m.firmwareId === msgId)) return;
         replaceMessages((current) =>
           current.map((message) =>
             message.firmwareId === msgId
@@ -270,7 +401,10 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
 
       if (packet.type === "error" || packet.type === "txError") {
         setLastError(asString(packet.message, "El nodo LoRa informó un error."));
-        const queuedId = outgoingQueue.current.shift();
+        const requestId = asString(packet.requestId);
+        // Unrelated configuration errors must not consume a modern send request.
+        const queuedId = requestId || (!packet.bootId ? outgoingQueue.current[0] : undefined);
+        outgoingQueue.current = outgoingQueue.current.filter(id => id !== queuedId);
         if (queuedId) {
           replaceMessages((current) =>
             current.map((message) =>
@@ -285,10 +419,19 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
 
       if (packet.type !== "message") return;
 
+      // Preserve receive order across asynchronous key derivation/decryption so
+      // a FINISH control cannot overtake the last data message at the receiver.
+      const previousIncoming = incomingMessages.current;
+      let unlockIncoming: () => void = () => {};
+      incomingMessages.current = new Promise<void>(resolve => { unlockIncoming = resolve; });
+      await previousIncoming;
+      try {
+
       const from = asString(packet.from, "desconocido");
       const isBroadcast = packet.broadcast === true;
       const encrypted = packet.encrypted === true;
       let text = asString(packet.text);
+      let receivedCryptoMetrics: CryptoOperationMetrics | undefined;
 
       if (encrypted) {
         const nested =
@@ -296,13 +439,42 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
             ? (packet.payload as Record<string, unknown>)
             : {};
         const cipherText = asString(nested.data);
+        let decryptionMetrics: CryptoOperationMetrics | undefined;
         try {
-          text = await decryptMessage(cipherText, networkKeyRef.current);
+          text = await decryptMessage(
+            cipherText,
+            networkKeyRef.current,
+            (metrics) => {
+              decryptionMetrics = metrics;
+            },
+          );
         } catch {
           text = "[No se pudo descifrar; comprueba la clave de red]";
         }
+        if (decryptionMetrics) {
+          receivedCryptoMetrics = decryptionMetrics;
+          void fieldTestsRef.current.append("cryptoDecrypt", { msgId: asString(packet.msgId),
+            ...decryptionMetrics }).catch(() => {});
+          void meshBleService.writeJson({
+            cmd: "cryptoMetric",
+            phase: "decrypt",
+            msgId: asString(packet.msgId),
+            securityMode: cipherText.startsWith("M2:")
+              ? "AES128"
+              : "AES256_LEGACY",
+            plaintextSizeBytes: decryptionMetrics.plaintextSizeBytes,
+            ciphertextSizeBytes: decryptionMetrics.ciphertextSizeBytes,
+            encodedCiphertextSizeBytes:
+              decryptionMetrics.encodedCiphertextSizeBytes,
+            decryptionTimeUs: decryptionMetrics.operationTimeUs,
+            decryptSuccess: decryptionMetrics.success,
+          }).catch(() => {
+            // Metrics must never interfere with receiving or displaying a message.
+          });
+        }
       }
 
+      if (!encrypted && decodeHealthShare(text)) text = "[Informe MAX30102 rechazado: recibido sin cifrado]";
       const incoming: MeshMessage = {
         id: asString(packet.msgId, Crypto.randomUUID()),
         firmwareId: asString(packet.msgId) || undefined,
@@ -322,6 +494,8 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
         snr: asNumber(packet.snr),
       };
 
+      if (fieldTestsRef.current.incoming(text, packet, receivedCryptoMetrics ? { ...receivedCryptoMetrics } : undefined)) return;
+
       if (
         messagesRef.current.some(
           (message) => message.firmwareId === incoming.firmwareId,
@@ -335,6 +509,7 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
           ? Haptics.NotificationFeedbackType.Warning
           : Haptics.NotificationFeedbackType.Success,
       );
+      } finally { unlockIncoming(); }
     },
     [replaceMessages],
   );
@@ -378,6 +553,10 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
 
   const connect = useCallback(
     async (deviceId: string) => {
+      fieldTestsRef.current.resetLink();
+      clearGps();
+      setNodeInfo(null);
+      setStatus(null);
       setLastError(null);
       setConnectionState("connecting");
       try {
@@ -385,6 +564,12 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
           deviceId,
           (packet) => void handlePacket(packet),
           (reason) => {
+            fieldTestsRef.current.resetLink();
+            outgoingQueue.current = [];
+            replaceMessages(current => current.map(m => m.direction === "outgoing" && ["queued", "sent"].includes(m.status)
+              ? { ...m, status: "unconfirmed" } : m));
+            clearGps();
+            setNodeInfo(null);
             setConnectedDevice(null);
             setConnectionState("disconnected");
             if (reason) setLastError(reason);
@@ -398,20 +583,28 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
         await meshBleService.writeJson({ cmd: "nodes" });
         await meshBleService.writeJson({ cmd: "status" });
       } catch (error) {
+        fieldTestsRef.current.resetLink();
+        setNodeInfo(null);
         setConnectionState("disconnected");
         const message = error instanceof Error ? error.message : String(error);
         setLastError(message);
         throw error;
       }
     },
-    [handlePacket],
+    [handlePacket, clearGps, replaceMessages],
   );
 
   const disconnect = useCallback(async () => {
+    fieldTestsRef.current.resetLink();
+    outgoingQueue.current = [];
+    replaceMessages(current => current.map(m => m.direction === "outgoing" && ["queued", "sent"].includes(m.status)
+      ? { ...m, status: "unconfirmed" } : m));
+    clearGps();
+    setNodeInfo(null);
     await meshBleService.disconnect();
     setConnectedDevice(null);
     setConnectionState("disconnected");
-  }, []);
+  }, [clearGps, replaceMessages]);
 
   const refreshNetwork = useCallback(async () => {
     if (connectionState !== "connected") return;
@@ -425,9 +618,23 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
       rawText: string,
       options: SendOptions = {},
     ) => {
+      if (fieldTestsRef.current.running() && !options.testSignal) {
+        throw new Error("Cancela o termina la prueba automática antes de enviar otros mensajes.");
+      }
       if (connectionState !== "connected") {
         throw new Error("Conecta tu nodo LoRa antes de enviar.");
       }
+
+      const sensitiveKey = networkKeyRef.current;
+      const sensitive = options.sensitive === true || decodeHealthShare(rawText.trim()) !== null;
+      const assertSensitiveSend = () => {
+        if (options.sendSignal?.aborted) throw new Error("Envío cancelado al cerrar la medición o perder la conexión.");
+        if (options.notAfter !== undefined && Date.now() > options.notAfter) throw new Error("La instantánea caducó antes de comenzar el envío; prepara otra.");
+        if (sensitive) assertHealthTransport({ encrypted: encryptionEnabledRef.current && encryptionEnabled,
+          key: networkKeyRef.current, expectedKey: sensitiveKey, aborted: options.sendSignal?.aborted === true,
+          now: Date.now(), notAfter: options.notAfter ?? Date.now() });
+      };
+      assertSensitiveSend();
 
       const text = rawText.trim();
       if (!text) throw new Error("Escribe un mensaje primero.");
@@ -442,7 +649,7 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
         conversationId === BROADCAST_ID
           ? null
           : nodes.find((node) => node.id === conversationId);
-      const localId = Crypto.randomUUID();
+      const localId = options.requestId ?? Crypto.randomUUID();
       const outgoing: MeshMessage = {
         id: localId,
         conversationId,
@@ -458,12 +665,19 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
         broadcast: conversationId === BROADCAST_ID,
       };
 
-      replaceMessages((current) => [...current, outgoing]);
+      if (!options.testSignal) replaceMessages((current) => [...current, outgoing]);
       outgoingQueue.current.push(localId);
 
       try {
+        let encryptionMetrics: CryptoOperationMetrics | undefined;
         const data = encryptionEnabled
-          ? await encryptMessage(text, networkKeyRef.current)
+          ? await encryptMessage(
+              text,
+              networkKeyRef.current,
+              (metrics) => {
+                encryptionMetrics = metrics;
+              },
+            )
           : text;
         const content = encryptionEnabled
           ? { payload: { encrypted: true, data } }
@@ -477,8 +691,33 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
                 ...content,
                 sos: options.sos === true,
               };
-        await meshBleService.writeJson(command);
-        await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        const plaintextSizeBytes = utf8Length(text);
+        const securityMetrics = encryptionEnabled && encryptionMetrics
+          ? {
+              securityMode: "AES128",
+              plaintextSizeBytes: encryptionMetrics.plaintextSizeBytes,
+              ciphertextSizeBytes: encryptionMetrics.ciphertextSizeBytes,
+              encodedCiphertextSizeBytes:
+                encryptionMetrics.encodedCiphertextSizeBytes,
+              encryptionTimeUs: encryptionMetrics.operationTimeUs,
+            }
+          : {
+              securityMode: "NONE",
+              plaintextSizeBytes,
+              ciphertextSizeBytes: plaintextSizeBytes,
+              encodedCiphertextSizeBytes: plaintextSizeBytes,
+              encryptionTimeUs: 0,
+            };
+        if (options.testSignal?.aborted) throw new Error("Prueba detenida antes del envío.");
+        if (fieldTestsRef.current.activeSession) {
+          const saved = fieldTestsRef.current.append("cryptoEncrypt", { requestId: localId, ...securityMetrics });
+          if (options.testSignal) await saved;
+          else void saved.catch(() => {}); // Logging failure must not prevent ordinary/emergency messaging.
+        }
+        if (options.testSignal?.aborted) throw new Error("Prueba detenida antes del envío.");
+        assertSensitiveSend();
+        await meshBleService.writeJson({ ...command, securityMetrics, requestId: localId }, assertSensitiveSend);
+        if (!options.testSignal) void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
       } catch (error) {
         outgoingQueue.current = outgoingQueue.current.filter(
           (id) => id !== localId,
@@ -502,8 +741,64 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
     ],
   );
 
+  transmitRef.current = (to, text, requestId, signal) => sendMessage(to, text, { requestId, testSignal: signal });
+
+  const requestNodeGps = useCallback(async (enabled?: boolean): Promise<NodeGps> => {
+    if (connectionState !== "connected" || !nodeInfo?.gpsSupported) {
+      throw new Error("Este nodo no ofrece GPS integrado.");
+    }
+    const requestId = Crypto.randomUUID();
+    return new Promise<NodeGps>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        gpsRequests.current.delete(requestId);
+        reject(new Error("El nodo no respondió al consultar el GPS. Vuelve a intentar."));
+      }, 6000);
+      gpsRequests.current.set(requestId, { nodeId: nodeInfo.nodeId, resolve, reject, timer });
+      void meshBleService.writeJson({
+        cmd: enabled === undefined ? "gps" : "setGps", requestId,
+        ...(enabled === undefined ? {} : { enabled }),
+      }).catch((error) => {
+        clearTimeout(timer);
+        gpsRequests.current.delete(requestId);
+        reject(error);
+      });
+    });
+  }, [connectionState, nodeInfo]);
+
+  const setNodeGpsEnabled = useCallback(async (enabled: boolean) => {
+    await requestNodeGps(enabled);
+  }, [requestNodeGps]);
+
+  const setNodeHealthEnabled = useCallback(async (enabled: boolean): Promise<void> => {
+    if (connectionState !== "connected" || !nodeInfo?.healthSupported) {
+      throw new Error("Este firmware no ofrece soporte MAX30102.");
+    }
+    const requestId = Crypto.randomUUID();
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        healthRequests.current.delete(requestId);
+        reject(new Error("El nodo no respondió al configurar el sensor."));
+      }, 6000);
+      healthRequests.current.set(requestId, { nodeId: nodeInfo.nodeId, resolve, reject, timer });
+      void meshBleService.writeJson({ cmd: "setHealth", enabled, requestId }).catch((error) => {
+        clearTimeout(timer);
+        healthRequests.current.delete(requestId);
+        reject(error);
+      });
+    });
+  }, [connectionState, nodeInfo]);
+
   const sendLocationSos = useCallback(
     async (conversationId: string) => {
+      if (connectionState !== "connected") throw new Error("Conecta tu nodo LoRa antes de enviar.");
+      if (nodeInfo?.gpsSupported) {
+        const position = await requestNodeGps();
+        if (position.enabled) {
+          await sendMessage(conversationId, gpsSosText(position), { sos: true });
+          return;
+        }
+        // Phone GPS is used only when node GPS is explicitly disabled.
+      }
       const permission = await Location.requestForegroundPermissionsAsync();
       if (!permission.granted) {
         throw new Error("No se concedió el permiso de ubicación.");
@@ -514,7 +809,7 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
       const text = `SOS ${location.coords.latitude.toFixed(5)},${location.coords.longitude.toFixed(5)}`;
       await sendMessage(conversationId, text, { sos: true });
     },
-    [sendMessage],
+    [connectionState, nodeInfo?.gpsSupported, requestNodeGps, sendMessage],
   );
 
   const setNodeName = useCallback(async (name: string) => {
@@ -527,6 +822,7 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
   }, []);
 
   const updateNetworkKey = useCallback(async (key: string) => {
+    if (fieldTestsRef.current.running()) throw new Error("Detén la prueba antes de cambiar la clave de red.");
     const cleanKey = key.trim();
     if (cleanKey.length < 12) {
       throw new Error("Usa una clave de red de al menos 12 caracteres.");
@@ -537,6 +833,8 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
   }, []);
 
   const setEncryptionEnabled = useCallback(async (enabled: boolean) => {
+    if (fieldTestsRef.current.running()) throw new Error("Detén la prueba antes de cambiar el cifrado.");
+    encryptionEnabledRef.current = enabled;
     setEncryptionEnabledState(enabled);
     await saveSettings({ encryptionEnabled: enabled });
   }, []);
@@ -594,6 +892,11 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
       nodeInfo,
       nodes,
       status,
+      gps,
+      setNodeGpsEnabled,
+      health,
+      subscribeHealth,
+      setNodeHealthEnabled,
       messages,
       conversations,
       networkKey,
@@ -613,6 +916,16 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
       updateNetworkKey,
       setEncryptionEnabled,
       clearHistory,
+      metricSessions: fieldTests.sessions,
+      metricSessionId: fieldTests.activeSession,
+      metricError: fieldTests.error,
+      metricsReady: fieldTests.ready,
+      testProgress: fieldTests.progress,
+      startTest: fieldTests.start,
+      cancelTest: fieldTests.cancel,
+      metricArchive: fieldTests.archive,
+      trialState: fieldTests.view,
+      setTrialMode: fieldTests.setMode,
     }),
     [
       ready,
@@ -622,6 +935,11 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
       nodeInfo,
       nodes,
       status,
+      gps,
+      setNodeGpsEnabled,
+      health,
+      subscribeHealth,
+      setNodeHealthEnabled,
       messages,
       conversations,
       networkKey,
@@ -638,6 +956,7 @@ export function MeshProvider({ children }: React.PropsWithChildren) {
       updateNetworkKey,
       setEncryptionEnabled,
       clearHistory,
+      fieldTests,
     ],
   );
 

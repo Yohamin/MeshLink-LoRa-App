@@ -15,10 +15,15 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { Colors } from "@/constants/colors";
-import { BROADCAST_ID, EMERGENCY_PRESETS } from "@/constants/mesh";
+import {
+  BROADCAST_ID,
+  EMERGENCY_PRESETS,
+  ENCRYPTION_LABEL,
+} from "@/constants/mesh";
 import { useMesh } from "@/context/mesh-context";
 import { formatTime, utf8Length } from "@/lib/text";
 import type { MeshMessage } from "@/types/mesh";
+import { decodeHealthShare, formatHealthShare } from "@/lib/health-share";
 
 function DeliveryIcon({ message }: { message: MeshMessage }) {
   if (message.direction === "incoming") return null;
@@ -45,6 +50,7 @@ function DeliveryIcon({ message }: { message: MeshMessage }) {
 
 function MessageBubble({ message }: { message: MeshMessage }) {
   const outgoing = message.direction === "outgoing";
+  const report = decodeHealthShare(message.text);
   return (
     <View style={[styles.messageRow, outgoing && styles.messageRowOutgoing]}>
       <View
@@ -61,7 +67,8 @@ function MessageBubble({ message }: { message: MeshMessage }) {
             <Text style={styles.sosHeaderText}>EMERGENCIA</Text>
           </View>
         )}
-        <Text style={styles.messageText}>{message.text}</Text>
+        <Text style={styles.messageText}>{report ? formatHealthShare(report) : message.text}</Text>
+        {report && <Text style={styles.time}>Contacta a la persona para conocer su situación actual. Declaración del emisor; identidad no certificada. {message.broadcast ? "Broadcast sin confirmación de entrega." : "ACK de radio no confirma que una persona lo haya leído."}</Text>}
         <View style={styles.metaRow}>
           {message.encrypted && (
             <Ionicons name="lock-closed" size={10} color={Colors.muted} />
@@ -85,6 +92,8 @@ export default function ChatScreen() {
     encryptionEnabled,
     sendMessage,
     sendLocationSos,
+    nodeInfo,
+    gps,
   } = useMesh();
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -187,19 +196,20 @@ export default function ChatScreen() {
                   <Text style={styles.presetText}>{preset.label}</Text>
                 </TouchableOpacity>
               ))}
-              <TouchableOpacity style={styles.locationPreset} onPress={() => void sendLocation()}>
+              <TouchableOpacity style={styles.locationPreset} disabled={sending || connectionState !== "connected"} onPress={() => void sendLocation()}>
                 <Ionicons name="location" size={16} color={Colors.white} />
                 <Text style={styles.locationPresetText}>Ubicación</Text>
               </TouchableOpacity>
             </View>
             <Text style={styles.emergencyNote}>El firmware actual marca los paquetes SOS, pero todavía no interrumpe los mensajes que ya se están transmitiendo.</Text>
+            <Text style={styles.emergencyNote}>Ubicación: {nodeInfo?.gpsSupported && gps?.enabled !== false ? "GPS del nodo V4 (requiere posición reciente)" : "GPS del teléfono"}.</Text>
           </View>
         )}
 
         <View style={styles.composerArea}>
           <View style={styles.securityRow}>
             <Ionicons name={encryptionEnabled ? "lock-closed" : "lock-open"} size={11} color={Colors.muted} />
-            <Text style={styles.securityText}>{encryptionEnabled ? "AES-256-GCM" : "SIN CIFRAR"}</Text>
+            <Text style={styles.securityText}>{encryptionEnabled ? ENCRYPTION_LABEL : "SIN CIFRAR"}</Text>
             <Text style={[styles.counter, tooLong && styles.counterError]}>{byteCount}/{maxMessageBytes} bytes</Text>
           </View>
           <View style={styles.composerRow}>

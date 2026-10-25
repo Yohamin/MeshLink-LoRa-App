@@ -1,4 +1,6 @@
 import { Ionicons } from "@expo/vector-icons";
+import Constants from "expo-constants";
+import { router } from "expo-router";
 import { useEffect, useState } from "react";
 import {
   Alert,
@@ -13,15 +15,22 @@ import {
 import { ConnectionPill } from "@/components/connection-pill";
 import { Screen } from "@/components/screen";
 import { Colors } from "@/constants/colors";
-import { DEMO_NETWORK_KEY } from "@/constants/mesh";
+import { DEMO_NETWORK_KEY, ENCRYPTION_LABEL } from "@/constants/mesh";
 import { useMesh } from "@/context/mesh-context";
 import { networkKeyId, testEncryptionRoundTrip } from "@/lib/crypto";
 import { shortNodeId } from "@/lib/text";
+import { gpsIsFresh } from "@/lib/gps";
+import { healthIsFresh, healthStatusText } from "@/lib/health";
 
 export default function SettingsScreen() {
   const {
     connectedDevice,
     nodeInfo,
+    gps,
+    connectionState,
+    setNodeGpsEnabled,
+    health,
+    setNodeHealthEnabled,
     networkKey,
     encryptionEnabled,
     setNodeName,
@@ -33,6 +42,27 @@ export default function SettingsScreen() {
   const [key, setKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [activeKeyId, setActiveKeyId] = useState("Comprobando...");
+  const [gpsBusy, setGpsBusy] = useState(false);
+  const [healthBusy, setHealthBusy] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const toggleGps = async (enabled: boolean) => {
+    setGpsBusy(true);
+    try { await setNodeGpsEnabled(enabled); }
+    catch (error) { Alert.alert("GPS del nodo", error instanceof Error ? error.message : String(error)); }
+    finally { setGpsBusy(false); }
+  };
+  const toggleHealth = async (enabled: boolean) => {
+    setHealthBusy(true);
+    try { await setNodeHealthEnabled(enabled); }
+    catch (error) { Alert.alert("MAX30102", error instanceof Error ? error.message : String(error)); }
+    finally { setHealthBusy(false); }
+  };
+  const healthLive = healthIsFresh(health, now);
 
   useEffect(() => setName(nodeInfo?.nodeName ?? ""), [nodeInfo?.nodeName]);
   useEffect(() => setKey(networkKey), [networkKey]);
@@ -58,6 +88,9 @@ export default function SettingsScreen() {
   const saveKey = async () => {
     try {
       const cleanKey = key.trim();
+      if (cleanKey.length < 12) {
+        throw new Error("Usa una clave de red de al menos 12 caracteres.");
+      }
       const selfTestPassed = await testEncryptionRoundTrip(cleanKey);
       if (!selfTestPassed) throw new Error("La prueba local de AES falló.");
       await updateNetworkKey(cleanKey);
@@ -76,6 +109,10 @@ export default function SettingsScreen() {
       <Text style={styles.eyebrow}>DISPOSITIVO Y PRIVACIDAD</Text>
       <Text style={styles.title}>Ajustes</Text>
       <ConnectionPill />
+      <TouchableOpacity accessibilityRole="button" style={styles.card} onPress={() => router.push("/health-measurements")}>
+        <Text style={styles.identityName}>Apoyo en emergencias · MAX30102</Text>
+        <Text style={styles.identityId}>Comunicar el estado de la persona, guardar mediciones y compartir informes por LoRa.</Text>
+      </TouchableOpacity>
 
       <Text style={styles.sectionTitle}>RADIO LOCAL</Text>
       <View style={styles.card}>
@@ -84,6 +121,7 @@ export default function SettingsScreen() {
           <View style={styles.identityCopy}>
             <Text style={styles.identityName}>{nodeInfo?.nodeName ?? connectedDevice?.name ?? "Sin conexión"}</Text>
             <Text style={styles.identityId}>{nodeInfo?.nodeId ? shortNodeId(nodeInfo.nodeId) : "Conecta un nodo para editar su identidad"}</Text>
+            {nodeInfo?.board && <Text style={styles.identityId}>{nodeInfo.board} · FW {nodeInfo.firmwareVersion}</Text>}
           </View>
         </View>
         <Text style={styles.label}>NOMBRE DEL NODO · MÁX. 32 BYTES</Text>
@@ -100,16 +138,58 @@ export default function SettingsScreen() {
         </TouchableOpacity>
       </View>
 
+      {nodeInfo?.gpsSupported && (
+        <>
+          <Text style={styles.sectionTitle}>GPS DEL NODO V4</Text>
+          <View style={styles.card}>
+            <View style={styles.identityRow}>
+              <View style={styles.gpsCopy}>
+                <Text style={styles.identityName}>Usar GPS del módulo</Text>
+                <Text style={styles.identityId}>{gpsIsFresh(gps, now) ? "Posición reciente disponible" : gps?.enabled ? "Buscando satélites / sin posición reciente" : "Apagado o esperando estado"}</Text>
+              </View>
+              <Switch value={gps?.enabled === true} disabled={gpsBusy || connectionState !== "connected" || !gps}
+                onValueChange={(enabled) => void toggleGps(enabled)} />
+            </View>
+            <Text style={styles.identityId}>Satélites: {gps?.satellites ?? 0} · Sentencias NMEA: {gps?.validSentences ?? 0}</Text>
+            <Text style={styles.identityId}>Al pulsar «Ubicación» se utiliza el GPS del nodo. No se difunden coordenadas automáticamente. Si lo apagas, se utiliza la ubicación del teléfono.</Text>
+          </View>
+        </>
+      )}
+
+      {nodeInfo?.healthSupported && (
+        <>
+          <Text style={styles.sectionTitle}>MAX30102 · EXPERIMENTAL</Text>
+          <View style={styles.card}>
+            <View style={styles.identityRow}>
+              <View style={styles.gpsCopy}>
+                <Text style={styles.identityName}>Leer sensor del nodo</Text>
+                <Text style={styles.identityId}>{healthStatusText(health, now)}</Text>
+              </View>
+              <Switch value={health?.enabled === true}
+                disabled={healthBusy || connectionState !== "connected" || !health}
+                onValueChange={(enabled) => void toggleHealth(enabled)} />
+            </View>
+            <Text style={styles.identityName}>Pulso estimado: {healthLive && health?.heartRateBpm !== null ? health?.heartRateBpm : "—"} lpm</Text>
+            <Text style={styles.identityName}>SpO₂ estimada: {healthLive && health?.spo2Percent !== null ? health?.spo2Percent : "—"} %</Text>
+            <Text style={styles.identityId}>Rojo: {health?.red ?? "—"} · IR: {health?.infrared ?? "—"}</Text>
+            <Text style={styles.identityId}>Muestras: {health?.samplesReceived ?? 0} · Reinicios FIFO: {health?.fifoResets ?? 0} · Errores I²C: {health?.i2cErrors ?? 0}</Text>
+            <Text style={styles.identityId}>Mediciones orientativas de apoyo en emergencias. No sustituyen una evaluación médica. No esperes al sensor para pedir ayuda. Se desactiva al reiniciar el nodo.</Text>
+            <Text style={styles.identityId}>Consulta por BLE sin nueva autenticación. Para registrar o compartir abre «Apoyo en emergencias» y confirma cada envío. Activa el sensor solo después de comprobar alimentación y conexiones.</Text>
+          </View>
+        </>
+      )}
+
       <Text style={styles.sectionTitle}>SEGURIDAD DE MENSAJES</Text>
       <View style={styles.card}>
         <View style={styles.settingRow}>
           <View style={styles.settingCopy}>
             <Text style={styles.settingTitle}>Cifrado autenticado</Text>
-            <Text style={styles.settingText}>Cifrado AES-256-GCM y detección de alteraciones</Text>
+            <Text style={styles.settingText}>Cifrado {ENCRYPTION_LABEL} y detección de alteraciones</Text>
           </View>
           <Switch
             value={encryptionEnabled}
-            onValueChange={(value) => void setEncryptionEnabled(value)}
+            onValueChange={(value) => void setEncryptionEnabled(value).catch(error =>
+              Alert.alert("Cifrado", error instanceof Error ? error.message : String(error)))}
             trackColor={{ false: Colors.border, true: "#7EE0A0" }}
             thumbColor={encryptionEnabled ? Colors.primary : Colors.muted}
           />
@@ -153,7 +233,9 @@ export default function SettingsScreen() {
         <Ionicons name="trash-outline" size={19} color={Colors.danger} />
         <Text style={styles.dangerText}>Borrar historial de mensajes</Text>
       </TouchableOpacity>
-      <Text style={styles.version}>Prototipo MeshLink · Protocolo de firmware 5.1</Text>
+      <Text style={styles.version}>
+        Prototipo MeshLink · App {Constants.expoConfig?.version ?? "1.3.0"} · Protocolo de firmware 5.1
+      </Text>
     </Screen>
   );
 }
@@ -166,6 +248,7 @@ const styles = StyleSheet.create({
   identityRow: { alignItems: "center", flexDirection: "row", marginBottom: 16 },
   iconCircle: { alignItems: "center", backgroundColor: Colors.accentSoft, borderRadius: 20, height: 40, justifyContent: "center", width: 40 },
   identityCopy: { marginLeft: 10 },
+  gpsCopy: { flex: 1, paddingRight: 8 },
   identityName: { color: Colors.ink, fontSize: 15, fontWeight: "900" },
   identityId: { color: Colors.muted, fontSize: 11, marginTop: 2 },
   label: { color: Colors.muted, fontSize: 9, fontWeight: "900", letterSpacing: 0.8, marginBottom: 6, marginTop: 4 },

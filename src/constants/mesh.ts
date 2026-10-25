@@ -6,6 +6,7 @@ export const BLE_CHUNK_BYTES = 180;
 export const BROADCAST_ID = "broadcast";
 export const ENCRYPTED_TEXT_LIMIT = 32;
 export const PLAIN_TEXT_LIMIT = 40;
+export const ENCRYPTION_LABEL = "AES-128-GCM";
 export const DEMO_NETWORK_KEY = "ClaveSecreta123!";
 
 export const STORAGE_KEYS = {

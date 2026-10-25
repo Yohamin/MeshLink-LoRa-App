@@ -6,6 +6,11 @@ node_modules/
 # Expo
 .expo/
 dist/
+dist-v4-validation/
+dist-v4-android-validation/
+dist-max30102-android-validation/
+dist-field-tests-validation/
+dist-health-measurements-validation/
 web-build/
 expo-env.d.ts
 
@@ -55,3 +60,4 @@ example
 /android/**/build/
 *.apk
 *.aab
+/experimental/

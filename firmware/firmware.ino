@@ -10,10 +10,18 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <esp_system.h>
+#include <esp_timer.h>
+#include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include "board_profile.h"
+#include "nmea_gps.h"
+#include "routing_policy.h"
+#include "max30102_sensor.h"
 
 // =====================================================
 // LoRa Mesh - Capa 5.1
-// Heltec WiFi LoRa 32 V3 + RadioLib
+// Heltec WiFi LoRa 32 V3 / V4 + RadioLib (wire protocol 5.1)
 //
 // Incluye:
 // - OLED funcional con Software I2C
@@ -40,7 +48,6 @@
 #define OLED_SDA 17
 #define OLED_SCL 18
 #define OLED_RST 21
-#define VEXT_PIN 36
 
 U8G2_SSD1306_128X64_NONAME_F_SW_I2C oled(
   U8G2_R0,
@@ -71,21 +78,18 @@ SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_RST, LORA_BUSY);
 #define LORA_SF        7
 #define LORA_CR        5
 #define LORA_SYNC_WORD 0x12
-#define LORA_POWER     14
+#define LORA_POWER     MESH_RADIO_DRIVE_DBM
 #define LORA_PREAMBLE  8
 
 // =====================
 // Limites
 // =====================
-#define MAX_NODES 10
 #define EXPECTED_NODES 2
 #define NODE_TIMEOUT_MS 90000
 
 #define MAX_TEXT_BYTES 40
 #define MAX_PACKET_BYTES 240
 #define MAX_BLE_COMMAND_BYTES 768
-#define MAX_SEEN_MESSAGES 30
-#define MAX_PENDING_ACKS 10
 
 #define DEFAULT_TTL 3
 #define ACK_TIMEOUT_MS 8000
@@ -128,6 +132,26 @@ unsigned long bleNotificationsSent = 0;
 String lastBleCommand = "Sin comandos";
 String bleCommandBuffer = "";
 
+// Only loop() executes commands and accesses the radio. BLE callbacks enqueue
+// complete frames; this also prevents concurrent multi-chunk notifications.
+struct MeshCommand { char text[MAX_BLE_COMMAND_BYTES + 1]; };
+QueueHandle_t commandQueue = nullptr;
+StaticQueue_t commandQueueControl;
+volatile bool commandQueueOverflow = false;
+volatile bool commandBufferOverflow = false;
+unsigned long commandQueueDrops = 0;
+
+#if MESH_HAS_GPS
+HardwareSerial gpsSerial(1);
+#endif
+MeshGpsReader gpsReader;
+bool gpsEnabled = false;
+bool gpsUartReady = false;
+MeshMax30102 healthSensor;
+#if MESH_HAS_MAX30102
+bool healthDiagnosticSerial = false; // Explicit opt-in, OFF at boot.
+#endif
+
 // =====================
 // Identidad
 // =====================
@@ -135,6 +159,15 @@ Preferences prefs;
 
 String nodeId = "";
 String nodeName = "";
+String bootId;
+uint32_t metricsEpoch = 0;
+String activeBleRequestId;
+// Command execution is confined to loop(); scope prevents leaking request IDs
+// into unrelated asynchronous ACKs, sensor updates or configuration errors.
+struct MeshRequestScope {
+  explicit MeshRequestScope(const String &id) { activeBleRequestId = id.substring(0, 64); }
+  ~MeshRequestScope() { activeBleRequestId = ""; }
+};
 
 // Cambiar el namespace fuerza a regenerar nombres automaticos.
 // Se usa v2 para evitar nombres repetidos guardados con la logica anterior.
@@ -162,10 +195,19 @@ struct PendingAck {
   String msgId;
   String to;
   unsigned long sentAt;
+  bool encrypted;
   bool active;
 };
 
 PendingAck pendingAcks[MAX_PENDING_ACKS];
+
+struct SecurityTxMetrics {
+  bool available;
+  unsigned long plaintextSizeBytes;
+  unsigned long ciphertextSizeBytes;
+  unsigned long encodedCiphertextSizeBytes;
+  unsigned long encryptionTimeUs;
+};
 
 // =====================
 // Metricas
@@ -216,6 +258,24 @@ unsigned long latencySamples = 0;
 unsigned long minLatencyMs = 0;
 unsigned long maxLatencyMs = 0;
 
+String lastSecurityMode = "NONE";
+unsigned long lastPlaintextSizeBytes = 0;
+unsigned long lastCiphertextSizeBytes = 0;
+unsigned long lastEncodedCiphertextSizeBytes = 0;
+unsigned long lastTransmittedSizeBytes = 0;
+long lastCryptoOverheadBytes = 0;
+float lastCryptoOverheadPercent = 0.0;
+unsigned long lastEncryptionTimeUs = 0;
+uint64_t encryptionTimeSumUs = 0;
+unsigned long encryptionTimeSamples = 0;
+unsigned long lastDecryptionTimeUs = 0;
+uint64_t decryptionTimeSumUs = 0;
+unsigned long decryptionTimeSamples = 0;
+bool lastDecryptSuccess = false;
+unsigned long decryptSuccessCount = 0;
+unsigned long decryptFailureCount = 0;
+bool lastLatencySecurityAes128 = false;
+
 float lastRssi = 0;
 float lastSnr = 0;
 
@@ -252,10 +312,13 @@ void sendMeshMessageDirect(String to, String text, bool sos);
 void sendMeshMessageAuto(String to, String text, bool sos);
 void sendMeshMessageVia(String relayNodeId, String finalTo, String text, bool sos, String routeLabel = "via", String modeLabel = "via");
 void sendMeshMessage(String to, String text, bool sos);
-void sendMeshPayloadDirect(String to, String data, bool encrypted, bool sos);
-void sendMeshPayloadAuto(String to, String data, bool encrypted, bool sos);
-void sendMeshPayloadVia(String relayNodeId, String finalTo, String data, bool encrypted, bool sos, String routeLabel = "via", String modeLabel = "via");
-bool extractCommandPayload(StaticJsonDocument<512> &doc, String &data, bool &encrypted);
+void sendMeshPayloadDirect(String to, String data, bool encrypted, bool sos, const SecurityTxMetrics &securityMetrics);
+void sendMeshPayloadAuto(String to, String data, bool encrypted, bool sos, const SecurityTxMetrics &securityMetrics);
+void sendMeshPayloadVia(String relayNodeId, String finalTo, String data, bool encrypted, bool sos, const SecurityTxMetrics &securityMetrics, String routeLabel = "via", String modeLabel = "via");
+bool extractCommandPayload(StaticJsonDocument<768> &doc, String &data, bool &encrypted, SecurityTxMetrics &securityMetrics);
+void recordDecryptionMetric(StaticJsonDocument<768> &doc);
+void sendBleGps(String requestId = "");
+void sendBleHealth(String requestId = "");
 
 class MeshBleServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *server) {
@@ -266,6 +329,7 @@ class MeshBleServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer *server) {
     bleConnected = false;
     bleCommandBuffer = "";
+    if (commandQueue) xQueueReset(commandQueue);
     Serial.println("[BLE] App desconectada");
     delay(100);
     BLEDevice::startAdvertising();
@@ -314,6 +378,16 @@ float getPdrAck() {
 float getAvgLatency() {
   if (latencySamples == 0) return 0.0;
   return (float)latencySumMs / (float)latencySamples;
+}
+
+float getAvgEncryptionTimeUs() {
+  if (encryptionTimeSamples == 0) return 0.0;
+  return (float)encryptionTimeSumUs / (float)encryptionTimeSamples;
+}
+
+float getAvgDecryptionTimeUs() {
+  if (decryptionTimeSamples == 0) return 0.0;
+  return (float)decryptionTimeSumUs / (float)decryptionTimeSamples;
 }
 
 void updateLatencyStats(unsigned long latencyMs) {
@@ -429,7 +503,7 @@ bool readJsonFlag(JsonVariantConst value) {
 
 // Formatos BLE aceptados:
 // 1) Recomendado:
-//    {"cmd":"send","to":"N-...","payload":{"encrypted":true,"data":"BASE64"}}
+//    {"cmd":"send","to":"N-...","payload":{"encrypted":true,"data":"M2:BASE64"}}
 // 2) Compatible:
 //    {"cmd":"send","to":"N-...","encrypted":true,"data":"BASE64"}
 // 3) Texto existente:
@@ -437,9 +511,10 @@ bool readJsonFlag(JsonVariantConst value) {
 //
 // El firmware nunca descifra ni altera data. En LoRa se usan las claves
 // compactas x=data y e=1 para ahorrar bytes.
-bool extractCommandPayload(StaticJsonDocument<512> &doc, String &data, bool &encrypted) {
+bool extractCommandPayload(StaticJsonDocument<768> &doc, String &data, bool &encrypted, SecurityTxMetrics &securityMetrics) {
   data = "";
   encrypted = false;
+  securityMetrics = {};
 
   JsonVariant payloadVariant = doc["payload"];
   JsonVariant textVariant = doc["text"];
@@ -459,6 +534,21 @@ bool extractCommandPayload(StaticJsonDocument<512> &doc, String &data, bool &enc
     data = String(doc["text"] | "");
   }
 
+  JsonObject securityObject = doc["securityMetrics"].as<JsonObject>();
+  if (!securityObject.isNull()) {
+    securityMetrics.available = true;
+    securityMetrics.plaintextSizeBytes = securityObject["plaintextSizeBytes"] | 0;
+    securityMetrics.ciphertextSizeBytes = securityObject["ciphertextSizeBytes"] | 0;
+    securityMetrics.encodedCiphertextSizeBytes = securityObject["encodedCiphertextSizeBytes"] | 0;
+    securityMetrics.encryptionTimeUs = securityObject["encryptionTimeUs"] | 0;
+  } else {
+    // Legacy/plain commands do not include app-side timing. Preserve support
+    // while still reporting the sizes visible to this transport layer.
+    securityMetrics.plaintextSizeBytes = encrypted ? 0 : data.length();
+    securityMetrics.ciphertextSizeBytes = encrypted ? 0 : data.length();
+    securityMetrics.encodedCiphertextSizeBytes = data.length();
+  }
+
   if (encrypted) {
     if (data.length() == 0) {
       Serial.println("[CRYPTO] Payload cifrado rechazado: data vacio");
@@ -475,6 +565,86 @@ bool extractCommandPayload(StaticJsonDocument<512> &doc, String &data, bool &enc
   }
 
   return true;
+}
+
+void recordTxSecurityMetric(
+  String msgId,
+  bool encrypted,
+  const SecurityTxMetrics &securityMetrics,
+  unsigned long transmittedSizeBytes
+) {
+  lastSecurityMode = encrypted ? "AES128" : "NONE";
+  lastPlaintextSizeBytes = securityMetrics.plaintextSizeBytes;
+  lastCiphertextSizeBytes = securityMetrics.ciphertextSizeBytes;
+  lastEncodedCiphertextSizeBytes = securityMetrics.encodedCiphertextSizeBytes;
+  lastTransmittedSizeBytes = transmittedSizeBytes;
+  lastEncryptionTimeUs = securityMetrics.encryptionTimeUs;
+  lastCryptoOverheadBytes = (long)lastCiphertextSizeBytes - (long)lastPlaintextSizeBytes;
+  lastCryptoOverheadPercent = lastPlaintextSizeBytes > 0
+    ? ((float)lastCryptoOverheadBytes / (float)lastPlaintextSizeBytes) * 100.0
+    : 0.0;
+
+  if (encrypted && securityMetrics.available) {
+    encryptionTimeSumUs += lastEncryptionTimeUs;
+    encryptionTimeSamples++;
+  }
+
+  Serial.print("[SECURITY] msg_id=");
+  Serial.print(msgId);
+  Serial.print(" security_mode=");
+  Serial.print(lastSecurityMode);
+  Serial.print(" plaintext_size_bytes=");
+  Serial.print(lastPlaintextSizeBytes);
+  Serial.print(" ciphertext_size_bytes=");
+  Serial.print(lastCiphertextSizeBytes);
+  Serial.print(" encoded_ciphertext_size_bytes=");
+  Serial.print(lastEncodedCiphertextSizeBytes);
+  Serial.print(" transmitted_size_bytes=");
+  Serial.print(lastTransmittedSizeBytes);
+  Serial.print(" crypto_overhead_bytes=");
+  Serial.print(lastCryptoOverheadBytes);
+  Serial.print(" crypto_overhead_percent=");
+  Serial.print(lastCryptoOverheadPercent, 2);
+  Serial.print(" encryption_time_us=");
+  Serial.println(lastEncryptionTimeUs);
+}
+
+void recordDecryptionMetric(StaticJsonDocument<768> &doc) {
+  String msgId = doc["msgId"] | "";
+  String securityMode = doc["securityMode"] | "AES128";
+  lastSecurityMode = securityMode;
+  lastPlaintextSizeBytes = doc["plaintextSizeBytes"] | 0;
+  lastCiphertextSizeBytes = doc["ciphertextSizeBytes"] | 0;
+  lastEncodedCiphertextSizeBytes = doc["encodedCiphertextSizeBytes"] | 0;
+  lastDecryptionTimeUs = doc["decryptionTimeUs"] | 0;
+  lastDecryptSuccess = readJsonFlag(doc["decryptSuccess"]);
+  lastCryptoOverheadBytes = (long)lastCiphertextSizeBytes - (long)lastPlaintextSizeBytes;
+  lastCryptoOverheadPercent = lastPlaintextSizeBytes > 0
+    ? ((float)lastCryptoOverheadBytes / (float)lastPlaintextSizeBytes) * 100.0
+    : 0.0;
+
+  decryptionTimeSumUs += lastDecryptionTimeUs;
+  decryptionTimeSamples++;
+  if (lastDecryptSuccess) {
+    decryptSuccessCount++;
+  } else {
+    decryptFailureCount++;
+  }
+
+  Serial.print("[SECURITY] msg_id=");
+  Serial.print(msgId);
+  Serial.print(" security_mode=");
+  Serial.print(lastSecurityMode);
+  Serial.print(" decryption_time_us=");
+  Serial.print(lastDecryptionTimeUs);
+  Serial.print(" decrypt_success=");
+  Serial.print(lastDecryptSuccess ? "true" : "false");
+  Serial.print(" plaintext_size_bytes=");
+  Serial.print(lastPlaintextSizeBytes);
+  Serial.print(" ciphertext_size_bytes=");
+  Serial.print(lastCiphertextSizeBytes);
+  Serial.print(" encoded_ciphertext_size_bytes=");
+  Serial.println(lastEncodedCiphertextSizeBytes);
 }
 
 // =====================================================
@@ -522,6 +692,21 @@ void updateDisplay() {
   String line2 = "Mesh:" + String(online) + "/" + String(EXPECTED_NODES) + " PDR:" + String(getPdrAck(), 0) + "%";
   String line3 = "TX:" + String(txOk) + " RX:" + String(rxPackets) + " ACK:" + String(ackReceived);
   String line4 = "FWD:" + String(forwardedMessages) + " Lat:" + String(lastLatencyMs) + "ms";
+  if (MESH_HAS_GPS && (millis() / 5000) % 2) {
+    line4 = !gpsEnabled ? "GPS apagado" :
+      String(gpsReader.fresh(millis()) ? "GPS FIX " : "GPS buscando ") +
+      String(gpsReader.satellites) + " sat";
+  }
+  if (MESH_HAS_MAX30102 && (millis() / 5000) % 3 == 2) {
+    MeshHealthSnapshot health = healthSensor.snapshot();
+    bool fresh = health.enabled && health.present && health.contact && health.sampleSeen &&
+      uint32_t(millis() - health.lastSampleAt) <= 500 && health.valueSeen &&
+      uint32_t(millis() - health.lastValueAt) <= 2500;
+    line4 = fresh && !strcmp(health.state, "reading") ?
+      String("EXP HR:") + (health.heartValid ? String(health.heartRate) : "--") +
+      " O2:" + (health.spo2Valid ? String(health.spo2) : "--") :
+      String(meshHealthDisplayLabel(health));
+  }
 
   drawScreen(line1, line2, line3, line4);
 }
@@ -801,12 +986,13 @@ void markSeen(String msgId) {
 // =====================================================
 // Pending ACK
 // =====================================================
-void trackPendingAck(String msgId, String to) {
+void trackPendingAck(String msgId, String to, bool encrypted) {
   for (int i = 0; i < MAX_PENDING_ACKS; i++) {
     if (!pendingAcks[i].active) {
       pendingAcks[i].msgId = msgId;
       pendingAcks[i].to = to;
       pendingAcks[i].sentAt = millis();
+      pendingAcks[i].encrypted = encrypted;
       pendingAcks[i].active = true;
       return;
     }
@@ -815,6 +1001,7 @@ void trackPendingAck(String msgId, String to) {
   pendingAcks[0].msgId = msgId;
   pendingAcks[0].to = to;
   pendingAcks[0].sentAt = millis();
+  pendingAcks[0].encrypted = encrypted;
   pendingAcks[0].active = true;
 }
 
@@ -823,11 +1010,20 @@ bool resolvePendingAck(String ackFor) {
     if (pendingAcks[i].active && pendingAcks[i].msgId == ackFor) {
       unsigned long latency = millis() - pendingAcks[i].sentAt;
       updateLatencyStats(latency);
+      lastLatencySecurityAes128 = pendingAcks[i].encrypted;
+
+      Serial.print("[SECURITY] msg_id=");
+      Serial.print(ackFor);
+      Serial.print(" security_mode=");
+      Serial.print(lastLatencySecurityAes128 ? "AES128" : "NONE");
+      Serial.print(" latency_ms=");
+      Serial.println(latency);
 
       pendingAcks[i].active = false;
       pendingAcks[i].msgId = "";
       pendingAcks[i].to = "";
       pendingAcks[i].sentAt = 0;
+      pendingAcks[i].encrypted = false;
 
       return true;
     }
@@ -850,6 +1046,7 @@ void checkAckTimeouts() {
       pendingAcks[i].msgId = "";
       pendingAcks[i].to = "";
       pendingAcks[i].sentAt = 0;
+      pendingAcks[i].encrypted = false;
 
       ackTimeouts++;
       bleNotifyAckTimeout(timeoutMsgId, timeoutTo);
@@ -858,6 +1055,7 @@ void checkAckTimeouts() {
 }
 
 void resetMetrics() {
+  ++metricsEpoch; // An explicit reset is a new counter epoch, not a new boot.
   txPackets = 0;
   rxPackets = 0;
   txOk = 0;
@@ -904,6 +1102,24 @@ void resetMetrics() {
   minLatencyMs = 0;
   maxLatencyMs = 0;
 
+  lastSecurityMode = "NONE";
+  lastPlaintextSizeBytes = 0;
+  lastCiphertextSizeBytes = 0;
+  lastEncodedCiphertextSizeBytes = 0;
+  lastTransmittedSizeBytes = 0;
+  lastCryptoOverheadBytes = 0;
+  lastCryptoOverheadPercent = 0.0;
+  lastEncryptionTimeUs = 0;
+  encryptionTimeSumUs = 0;
+  encryptionTimeSamples = 0;
+  lastDecryptionTimeUs = 0;
+  decryptionTimeSumUs = 0;
+  decryptionTimeSamples = 0;
+  lastDecryptSuccess = false;
+  decryptSuccessCount = 0;
+  decryptFailureCount = 0;
+  lastLatencySecurityAes128 = false;
+
   messageCounter = 0;
   lastMessageLine = "Sin mensajes";
 
@@ -911,6 +1127,7 @@ void resetMetrics() {
     pendingAcks[i].msgId = "";
     pendingAcks[i].to = "";
     pendingAcks[i].sentAt = 0;
+    pendingAcks[i].encrypted = false;
     pendingAcks[i].active = false;
   }
 
@@ -930,6 +1147,14 @@ void resetMetrics() {
 // =====================================================
 bool isBleReady() {
   return bleConnected && bleRxCharacteristic != nullptr;
+}
+
+void addTelemetryFields(JsonDocument &doc) {
+  if (activeBleRequestId.length()) doc["requestId"] = activeBleRequestId;
+  doc["nodeId"] = nodeId;
+  doc["bootId"] = bootId;
+  doc["uptimeMs"] = uint64_t(esp_timer_get_time() / 1000);
+  doc["metricsEpoch"] = metricsEpoch;
 }
 
 void bleNotifyLine(String payload) {
@@ -957,6 +1182,8 @@ void bleNotifyLine(String payload) {
 void bleNotifyEvent(String eventType, String message) {
   StaticJsonDocument<256> doc;
   doc["type"] = eventType;
+  addTelemetryFields(doc);
+  if (activeBleRequestId.length()) doc["requestId"] = activeBleRequestId;
   doc["message"] = message;
   doc["nodeId"] = nodeId;
   doc["nodeName"] = nodeName;
@@ -967,13 +1194,37 @@ void bleNotifyEvent(String eventType, String message) {
 }
 
 void sendBleInfo() {
-  StaticJsonDocument<384> doc;
+#if MESH_HAS_MAX30102
+  StaticJsonDocument<1024> doc;
+#else
+  StaticJsonDocument<768> doc;
+#endif
   doc["type"] = "info";
+  addTelemetryFields(doc);
+  doc["requestCorrelation"] = true;
+  doc["snapshotCorrelation"] = true;
+  doc["ackTimeoutMs"] = ACK_TIMEOUT_MS;
   doc["nodeId"] = nodeId;
   doc["nodeName"] = nodeName;
   doc["bleConnected"] = bleConnected;
   doc["layer"] = "5.1";
   doc["radio"] = "SX1262-RadioLib";
+  doc["firmwareVersion"] = "5.6.0";
+  doc["board"] = MESH_BOARD_NAME;
+  doc["gpsSupported"] = bool(MESH_HAS_GPS);
+  doc["healthSupported"] = bool(MESH_HAS_MAX30102);
+#if MESH_HAS_MAX30102
+  doc["healthDiagnosticRevision"] = 3;
+#endif
+  doc["maxNodes"] = MAX_NODES;
+  doc["sx1262DriveDbm"] = LORA_POWER;
+  doc["freePsramBytes"] = ESP.getFreePsram();
+  doc["frequencyMHz"] = LORA_FREQ;
+  doc["bandwidthKHz"] = LORA_BW;
+  doc["spreadingFactor"] = LORA_SF;
+  doc["codingRate"] = LORA_CR;
+  doc["syncWord"] = LORA_SYNC_WORD;
+  doc["preambleLength"] = LORA_PREAMBLE;
 
   String payload;
   serializeJson(doc, payload);
@@ -983,12 +1234,14 @@ void sendBleInfo() {
 void sendBleReady() {
   StaticJsonDocument<512> doc;
   doc["type"] = "ready";
+  addTelemetryFields(doc);
+  doc["requestCorrelation"] = true;
   doc["nodeId"] = nodeId;
   doc["nodeName"] = nodeName;
   doc["serviceUuid"] = BLE_SERVICE_UUID;
   doc["txUuid"] = BLE_TX_UUID;
   doc["rxUuid"] = BLE_RX_UUID;
-  doc["commands"] = "info,status,nodes,setName,resetName,resetMetrics,send,broadcast,sendDirect,sendvia(debug)";
+  doc["commands"] = "info,status,nodes,gps,setGps,health,setHealth,setName,resetName,resetMetrics,send,broadcast,sendDirect,sendvia(debug)";
 
   String payload;
   serializeJson(doc, payload);
@@ -996,9 +1249,10 @@ void sendBleReady() {
 }
 
 void sendBleStatus() {
-  StaticJsonDocument<1536> doc;
+  StaticJsonDocument<2048> doc;
 
   doc["type"] = "status";
+  addTelemetryFields(doc);
   doc["nodeId"] = nodeId;
   doc["nodeName"] = nodeName;
   doc["onlineNodes"] = getOnlineNodeCount();
@@ -1036,6 +1290,23 @@ void sendBleStatus() {
   m["avgLatencyMs"] = getAvgLatency();
   m["minLatencyMs"] = minLatencyMs;
   m["maxLatencyMs"] = maxLatencyMs;
+  m["securityModeAes128"] = lastSecurityMode == "AES128" ? 1 : 0;
+  m["plaintextSizeBytes"] = lastPlaintextSizeBytes;
+  m["ciphertextSizeBytes"] = lastCiphertextSizeBytes;
+  m["encodedCiphertextSizeBytes"] = lastEncodedCiphertextSizeBytes;
+  m["transmittedSizeBytes"] = lastTransmittedSizeBytes;
+  m["cryptoOverheadBytes"] = lastCryptoOverheadBytes;
+  m["cryptoOverheadPercent"] = lastCryptoOverheadPercent;
+  m["lastEncryptionTimeUs"] = lastEncryptionTimeUs;
+  m["avgEncryptionTimeUs"] = getAvgEncryptionTimeUs();
+  m["encryptionTimeSamples"] = encryptionTimeSamples;
+  m["lastDecryptionTimeUs"] = lastDecryptionTimeUs;
+  m["avgDecryptionTimeUs"] = getAvgDecryptionTimeUs();
+  m["decryptionTimeSamples"] = decryptionTimeSamples;
+  m["decryptSuccess"] = lastDecryptSuccess ? 1 : 0;
+  m["decryptSuccessCount"] = decryptSuccessCount;
+  m["decryptFailureCount"] = decryptFailureCount;
+  m["latencySecurityModeAes128"] = lastLatencySecurityAes128 ? 1 : 0;
   m["duplicates"] = duplicatePackets;
   m["invalidJson"] = invalidJsonPackets;
   m["corrupted"] = corruptedPackets;
@@ -1046,6 +1317,7 @@ void sendBleStatus() {
   m["notNextHopIgnored"] = notNextHopIgnored;
   m["guardedAnnounceSkips"] = guardedAnnounceSkips;
   m["sizeDroppedPackets"] = sizeDroppedPackets;
+  m["commandQueueDrops"] = commandQueueDrops;
 
   JsonObject b = doc.createNestedObject("ble");
   b["connected"] = bleConnected;
@@ -1064,8 +1336,9 @@ void sendBleNodes() {
   // Ten node entries, including dynamic IDs and names, can exceed a 1536-byte
   // ArduinoJson document. Keep this on the heap so BLE callbacks do not spend
   // most of their task stack on a large temporary object.
-  DynamicJsonDocument doc(4096);
+  DynamicJsonDocument doc(512 + MAX_NODES * 384);
   doc["type"] = "nodes";
+  addTelemetryFields(doc);
   doc["nodeId"] = nodeId;
   doc["nodeName"] = nodeName;
 
@@ -1099,6 +1372,8 @@ void sendBleNodes() {
 void bleNotifyTxResult(String msgId, String to, String mode, bool ok, int bytes, bool encrypted) {
   StaticJsonDocument<512> doc;
   doc["type"] = "sent";
+  addTelemetryFields(doc);
+  if (activeBleRequestId.length()) doc["requestId"] = activeBleRequestId;
   doc["ok"] = ok;
   doc["mode"] = mode;
   doc["msgId"] = msgId;
@@ -1116,6 +1391,8 @@ void bleNotifyTxResult(String msgId, String to, String mode, bool ok, int bytes,
 void bleNotifyMessageReceived(String msgId, String from, String fromName, String to, String data, bool encrypted, bool sos, bool isBroadcast, String route) {
   StaticJsonDocument<768> doc;
   doc["type"] = "message";
+  addTelemetryFields(doc);
+  doc["bytes"] = lastTransmittedSizeBytes;
   doc["msgId"] = msgId;
   doc["from"] = from;
   doc["fromName"] = fromName;
@@ -1143,6 +1420,9 @@ void bleNotifyMessageReceived(String msgId, String from, String fromName, String
 void bleNotifyAckReceived(String from, String ackFor) {
   StaticJsonDocument<512> doc;
   doc["type"] = "ack";
+  addTelemetryFields(doc);
+  doc["rssi"] = lastRssi;
+  doc["snr"] = lastSnr;
   doc["from"] = from;
   doc["to"] = nodeId;
   doc["ackFor"] = ackFor;
@@ -1159,6 +1439,7 @@ void bleNotifyAckReceived(String from, String ackFor) {
 void bleNotifyAckTimeout(String msgId, String to) {
   StaticJsonDocument<384> doc;
   doc["type"] = "ackTimeout";
+  addTelemetryFields(doc);
   doc["msgId"] = msgId;
   doc["to"] = to;
   doc["ackTimeouts"] = ackTimeouts;
@@ -1221,6 +1502,14 @@ void setFlag() {
 }
 
 void startReceiveMode() {
+#if MESH_HAS_GPS
+  digitalWrite(MESH_FEM_ENABLE_PIN, HIGH);
+#if MESH_BOARD_PROFILE == 42
+  digitalWrite(MESH_FEM_MODE_PIN, LOW); // GC1109 RX: CPS don't-care.
+#else
+  digitalWrite(MESH_FEM_MODE_PIN, LOW); // KCT8103L: enable RX LNA.
+#endif
+#endif
   int state = radio.startReceive();
 
   if (state == RADIOLIB_ERR_NONE) {
@@ -1249,6 +1538,10 @@ bool loraSend(String payload) {
 
   txPackets++;
 
+#if MESH_HAS_GPS
+  digitalWrite(MESH_FEM_ENABLE_PIN, HIGH);
+  digitalWrite(MESH_FEM_MODE_PIN, HIGH); // TX PA path; DIO2 switches automatically.
+#endif
   int state = radio.transmit(payload);
 
   // DIO1 tambien puede activarse por TX_DONE durante transmit(). Si la bandera
@@ -1378,10 +1671,15 @@ void sendAck(String to, String ackFor, String nextHop = "", String route = "") {
 }
 
 void sendMeshMessageDirect(String to, String text, bool sos) {
-  sendMeshPayloadDirect(to, text, false, sos);
+  SecurityTxMetrics securityMetrics = {};
+  securityMetrics.available = true;
+  securityMetrics.plaintextSizeBytes = text.length();
+  securityMetrics.ciphertextSizeBytes = text.length();
+  securityMetrics.encodedCiphertextSizeBytes = text.length();
+  sendMeshPayloadDirect(to, text, false, sos, securityMetrics);
 }
 
-void sendMeshPayloadDirect(String to, String data, bool encrypted, bool sos) {
+void sendMeshPayloadDirect(String to, String data, bool encrypted, bool sos, const SecurityTxMetrics &securityMetrics) {
   to.trim();
 
   if (to == nodeId) {
@@ -1439,6 +1737,7 @@ void sendMeshPayloadDirect(String to, String data, bool encrypted, bool sos) {
   Serial.println("[MSG] Enviando mensaje:");
   Serial.println("[MSG] Bytes: " + String(payload.length()));
   Serial.println(payload);
+  recordTxSecurityMetric(msgId, encrypted, securityMetrics, payload.length());
 
   bool ok = loraSend(payload);
   bleNotifyTxResult(msgId, to, isBroadcast ? "broadcast" : "direct", ok, payload.length(), encrypted);
@@ -1454,20 +1753,25 @@ void sendMeshPayloadDirect(String to, String data, bool encrypted, bool sos) {
     } else {
       directMessagesSent++;
       directPathSent++;
-      trackPendingAck(msgId, to);
+      trackPendingAck(msgId, to, encrypted);
     }
   }
 }
 
 void sendMeshMessageAuto(String to, String text, bool sos) {
-  sendMeshPayloadAuto(to, text, false, sos);
+  SecurityTxMetrics securityMetrics = {};
+  securityMetrics.available = true;
+  securityMetrics.plaintextSizeBytes = text.length();
+  securityMetrics.ciphertextSizeBytes = text.length();
+  securityMetrics.encodedCiphertextSizeBytes = text.length();
+  sendMeshPayloadAuto(to, text, false, sos, securityMetrics);
 }
 
-void sendMeshPayloadAuto(String to, String data, bool encrypted, bool sos) {
+void sendMeshPayloadAuto(String to, String data, bool encrypted, bool sos, const SecurityTxMetrics &securityMetrics) {
   to.trim();
 
   if (to == "broadcast") {
-    sendMeshPayloadDirect(to, data, encrypted, sos);
+    sendMeshPayloadDirect(to, data, encrypted, sos, securityMetrics);
     return;
   }
 
@@ -1486,13 +1790,13 @@ void sendMeshPayloadAuto(String to, String data, bool encrypted, bool sos) {
   if (relay.length() > 0) {
     autoRelaySelected++;
     Serial.println("[ROUTE] Relay automatico seleccionado: " + getNodeNameById(relay) + " (" + relay + ")");
-    sendMeshPayloadVia(relay, to, data, encrypted, sos, "auto", "auto");
+    sendMeshPayloadVia(relay, to, data, encrypted, sos, securityMetrics, "auto", "auto");
     return;
   }
 
   autoRelayNotFound++;
   Serial.println("[ROUTE] Sin relay automatico disponible. Envio directo hacia: " + to);
-  sendMeshPayloadDirect(to, data, encrypted, sos);
+  sendMeshPayloadDirect(to, data, encrypted, sos, securityMetrics);
 }
 
 // Mantiene compatibilidad: el comando send ahora usa enrutamiento automatico.
@@ -1501,10 +1805,15 @@ void sendMeshMessage(String to, String text, bool sos) {
 }
 
 void sendMeshMessageVia(String relayNodeId, String finalTo, String text, bool sos, String routeLabel, String modeLabel) {
-  sendMeshPayloadVia(relayNodeId, finalTo, text, false, sos, routeLabel, modeLabel);
+  SecurityTxMetrics securityMetrics = {};
+  securityMetrics.available = true;
+  securityMetrics.plaintextSizeBytes = text.length();
+  securityMetrics.ciphertextSizeBytes = text.length();
+  securityMetrics.encodedCiphertextSizeBytes = text.length();
+  sendMeshPayloadVia(relayNodeId, finalTo, text, false, sos, securityMetrics, routeLabel, modeLabel);
 }
 
-void sendMeshPayloadVia(String relayNodeId, String finalTo, String data, bool encrypted, bool sos, String routeLabel, String modeLabel) {
+void sendMeshPayloadVia(String relayNodeId, String finalTo, String data, bool encrypted, bool sos, const SecurityTxMetrics &securityMetrics, String routeLabel, String modeLabel) {
   relayNodeId.trim();
   finalTo.trim();
 
@@ -1563,6 +1872,7 @@ void sendMeshPayloadVia(String relayNodeId, String finalTo, String data, bool en
   Serial.println("  destino final: " + finalTo);
   Serial.println("[MSG] Bytes: " + String(payload.length()));
   Serial.println(payload);
+  recordTxSecurityMetric(msgId, encrypted, securityMetrics, payload.length());
 
   bool ok = loraSend(payload);
   bleNotifyTxResult(msgId, finalTo, modeLabel, ok, payload.length(), encrypted);
@@ -1580,7 +1890,7 @@ void sendMeshPayloadVia(String relayNodeId, String finalTo, String data, bool en
 
     lastPriorityTxAt = millis();
     scheduleNextAnnounce();
-    trackPendingAck(msgId, finalTo);
+    trackPendingAck(msgId, finalTo, encrypted);
   }
 }
 
@@ -1726,9 +2036,23 @@ void handleAck(StaticJsonDocument<512> &doc) {
     return;
   }
 
-  if (nextHop.length() > 0 && nextHop != nodeId) {
-    notNextHopIgnored++;
-    Serial.println("[ACK] Ignorado: nextHop es " + nextHop + " y este nodo es " + nodeId);
+  // A matching final recipient may hear the ACK before its relay forwards it.
+  // Accept it only for a pending message to that sender; other nodes still
+  // respect nextHop. This is evidence of radio receipt, not app decryption.
+  bool matchesPendingSender = false;
+  for (int i = 0; i < MAX_PENDING_ACKS; i++) {
+    if (pendingAcks[i].active && pendingAcks[i].msgId == ackFor && pendingAcks[i].to == from) {
+      matchesPendingSender = true;
+      break;
+    }
+  }
+  if (!meshAckAllows(to == nodeId, matchesPendingSender, nextHop.length() > 0, nextHop == nodeId)) {
+    if (to == nodeId) {
+      Serial.println("[ACK] Ignorado: sin mensaje pendiente para ese ID y remitente");
+    } else {
+      notNextHopIgnored++;
+      Serial.println("[ACK] Ignorado: nextHop es " + nextHop + " y este nodo es " + nodeId);
+    }
     return;
   }
 
@@ -1799,7 +2123,7 @@ void handleMessage(StaticJsonDocument<512> &doc) {
     return;
   }
 
-  if (nextHop.length() > 0 && nextHop != nodeId) {
+  if (!meshNextHopAllows(isForMe, nextHop.length() > 0, nextHop == nodeId)) {
     notNextHopIgnored++;
     Serial.println("[MESH] Mensaje ignorado: nextHop es " + nextHop + " y este nodo es " + nodeId);
     return;
@@ -1808,6 +2132,12 @@ void handleMessage(StaticJsonDocument<512> &doc) {
   if (msgId.length() > 0 && wasSeen(msgId)) {
     duplicatePackets++;
     Serial.println("[MESH] Mensaje duplicado descartado: " + msgId);
+    // Re-acknowledge a repeated addressed frame without showing it twice.
+    if (isForMe && needAck) {
+      String ackHop = ((route == "via" || route == "auto") && lastHop.length() > 0)
+        ? lastHop : "";
+      sendAck(from, msgId, ackHop, route);
+    }
     return;
   }
 
@@ -1905,6 +2235,8 @@ void processJsonPacket(String packet) {
   }
 
   if (type == "m" || type == "message") {
+    // Reuse the packet length already available at this receive boundary.
+    lastTransmittedSizeBytes = packet.length();
     handleMessage(doc);
     return;
   }
@@ -1998,6 +2330,23 @@ void printStatus() {
   Serial.println("Latencia ultima: " + String(lastLatencyMs) + " ms");
   Serial.println("Latencia promedio: " + String(getAvgLatency(), 2) + " ms");
   Serial.println("Latencia min/max: " + String(minLatencyMs) + " / " + String(maxLatencyMs) + " ms");
+  Serial.println("Modo de seguridad ultimo: " + lastSecurityMode);
+  Serial.println("Bytes texto/cifrado/encoded/TX: " +
+                 String(lastPlaintextSizeBytes) + " / " +
+                 String(lastCiphertextSizeBytes) + " / " +
+                 String(lastEncodedCiphertextSizeBytes) + " / " +
+                 String(lastTransmittedSizeBytes));
+  Serial.println("Overhead AES ultimo: " + String(lastCryptoOverheadBytes) +
+                 " bytes (" + String(lastCryptoOverheadPercent, 2) + "%)");
+  Serial.println("Cifrado AES ultimo/promedio: " + String(lastEncryptionTimeUs) +
+                 " / " + String(getAvgEncryptionTimeUs(), 2) + " us");
+  Serial.println("Descifrado AES ultimo/promedio: " + String(lastDecryptionTimeUs) +
+                 " / " + String(getAvgDecryptionTimeUs(), 2) + " us");
+  Serial.println("Descifrado ultimo/exitos/fallos: " +
+                 String(lastDecryptSuccess ? "OK" : "FALLO") + " / " +
+                 String(decryptSuccessCount) + " / " + String(decryptFailureCount));
+  Serial.println("Modo de seguridad de latencia ultima: " +
+                 String(lastLatencySecurityAes128 ? "AES128" : "NONE"));
   Serial.println("Duplicados: " + String(duplicatePackets));
   Serial.println("JSON invalidos: " + String(invalidJsonPackets));
   Serial.println("Paquetes corruptos/incompletos: " + String(corruptedPackets));
@@ -2035,9 +2384,14 @@ void printHelp() {
   Serial.println("sendvia <relayIndex> <destIndex> <texto>  // debug: relay manual");
   Serial.println("sendidvia <relayNodeId> <destNodeId> <texto>");
   Serial.println("JSON BLE/Serial auto: {\"cmd\":\"send\",\"to\":\"nodeId\",\"text\":\"hola\",\"sos\":false}");
-  Serial.println("JSON cifrado: {\"cmd\":\"send\",\"to\":\"nodeId\",\"payload\":{\"encrypted\":true,\"data\":\"BASE64\"}}");
+  Serial.println("JSON cifrado: {\"cmd\":\"send\",\"to\":\"nodeId\",\"payload\":{\"encrypted\":true,\"data\":\"M2:BASE64\"}}");
   Serial.println("JSON debug direct: {\"cmd\":\"sendDirect\",\"to\":\"nodeId\",\"text\":\"hola\"}");
   Serial.println("JSON debug via: {\"cmd\":\"sendvia\",\"relay\":\"nodeIdRelay\",\"to\":\"nodeIdFinal\",\"text\":\"hola\"}");
+  Serial.println("gps / gps on / gps off (V4 con GPS; no transmite coordenadas por LoRa)");
+  Serial.println("health / health on / health off (MAX30102 experimental, solo V4.3.1)");
+#if MESH_HAS_MAX30102
+  Serial.println("health diag on / health diag off (diagnostico r3 cada 2 s, sin datos fisiologicos)");
+#endif
   Serial.println("BLE TX write: " + String(BLE_TX_UUID));
   Serial.println("BLE RX notify: " + String(BLE_RX_UUID));
   Serial.println("La app debe reconstruir notificaciones hasta encontrar \\n.");
@@ -2047,8 +2401,200 @@ void printHelp() {
   Serial.println("--------------------");
 }
 
+void pollGps() {
+#if MESH_HAS_GPS
+  if (!gpsEnabled || !gpsUartReady) return;
+  unsigned budget = 512;
+  while (budget-- && gpsSerial.available()) gpsReader.feed(char(gpsSerial.read()), millis());
+#endif
+}
+
+void setGpsEnabled(bool enabled) {
+#if MESH_HAS_GPS
+  gpsEnabled = enabled;
+  gpsReader.clearFix();
+  if (gpsUartReady) gpsSerial.end();
+  gpsUartReady = false;
+  pinMode(MESH_GPS_POWER_PIN, OUTPUT);
+  digitalWrite(MESH_GPS_POWER_PIN, enabled ? LOW : HIGH);
+#if MESH_GPS_RESET_PIN >= 0
+  pinMode(MESH_GPS_RESET_PIN, OUTPUT);
+  digitalWrite(MESH_GPS_RESET_PIN, HIGH);
+#endif
+#if MESH_GPS_WAKE_PIN >= 0
+  pinMode(MESH_GPS_WAKE_PIN, OUTPUT);
+  digitalWrite(MESH_GPS_WAKE_PIN, enabled ? HIGH : LOW);
+#endif
+  if (enabled) {
+    gpsSerial.setRxBufferSize(2048);
+    gpsSerial.begin(MESH_GPS_BAUD, SERIAL_8N1, MESH_GPS_RX_PIN, MESH_GPS_TX_PIN);
+    gpsUartReady = true;
+  }
+  prefs.putBool("gpsEnabled", enabled);
+#else
+  gpsEnabled = false;
+#endif
+}
+
+void sendBleGps(String requestId) {
+  pollGps();
+  bool fresh = gpsEnabled && gpsReader.fresh(millis());
+  StaticJsonDocument<768> doc;
+  doc["type"] = "gps";
+  doc["nodeId"] = nodeId;
+  doc["requestId"] = requestId.substring(0, 64);
+  doc["supported"] = bool(MESH_HAS_GPS);
+  doc["enabled"] = gpsEnabled;
+  doc["hasFix"] = fresh;
+  doc["satellites"] = gpsReader.satellites;
+  doc["ageMs"] = gpsReader.hasPosition ? long(uint32_t(millis() - gpsReader.lastFixAt)) : -1L;
+  if (fresh) {
+    doc["latitude"] = gpsReader.latitude;
+    doc["longitude"] = gpsReader.longitude;
+  } // Never expose stale coordinates as a current fix.
+  doc["bytesReceived"] = gpsReader.bytesReceived;
+  doc["validSentences"] = gpsReader.validSentences;
+  doc["badSentences"] = gpsReader.badSentences;
+  String payload;
+  serializeJson(doc, payload);
+  bleNotifyLine(payload);
+  Serial.printf("[GPS] supported=%d enabled=%d fix=%d sats=%u bytes=%lu nmea_ok=%lu nmea_bad=%lu\n",
+    MESH_HAS_GPS, gpsEnabled, fresh, gpsReader.satellites,
+    (unsigned long)gpsReader.bytesReceived, (unsigned long)gpsReader.validSentences,
+    (unsigned long)gpsReader.badSentences);
+}
+
+void printHealthDiagnostics() {
+  MeshHealthSnapshot h = healthSensor.snapshot();
+  Serial.printf("[HEALTH] EXP state=%s enabled=%d present=%d samples=%lu resets=%lu i2c=%lu\n",
+    h.state, h.enabled, h.present, (unsigned long)h.samples,
+    (unsigned long)h.fifoResets, (unsigned long)h.i2cErrors);
+#if MESH_HAS_MAX30102
+  Serial.printf("[HEALTH-DIAG r3] sda=%d scl=%d addr=0x57 lastFault=%s faultAt=%lu window=%u sampleAgeMs=%ld\n",
+    MESH_MAX_SDA_PIN, MESH_MAX_SCL_PIN, h.lastFault, (unsigned long)h.lastFaultAt,
+    h.windowSamples, h.sampleSeen ? long(uint32_t(millis() - h.lastSampleAt)) : -1L);
+  Serial.printf("[HEALTH-DIAG] configAttempts=%lu configFailures=%lu ambient=%lu fifoOverflow=%lu noSamples=%lu gaps=%lu powerEvents=%lu\n",
+    (unsigned long)h.configAttempts, (unsigned long)h.configFailures,
+    (unsigned long)h.ambientOverflows, (unsigned long)h.fifoOverflows,
+    (unsigned long)h.sampleTimeouts, (unsigned long)h.sampleGaps, (unsigned long)h.powerEvents);
+  // Decimal register values; -1 means not observed in the current attempt.
+  Serial.printf("[HEALTH-REG] part=%d mode=%d spo2Config=%d fifoConfig=%d status=%d wr=%d ovf=%d rd=%d\n",
+    h.partId, h.modeRegister, h.configRegister, h.fifoConfigRegister,
+    h.statusRegister, h.fifoWrite, h.fifoOverflow, h.fifoRead);
+  Serial.printf("[HEALTH-I2C] lastOp=%s reg=%d wireCode=%d expected=%u received=%u\n",
+    h.lastI2cOperation, h.lastI2cRegister, h.lastI2cCode, h.lastI2cExpected, h.lastI2cReceived);
+  Serial.printf("[HEALTH-FIFO] verified=%lu failed=%lu limitHits=%lu pausedMode=%d clearWr=%d clearOvf=%d clearRd=%d resumedMode=%d\n",
+    (unsigned long)h.fifoResetsVerified, (unsigned long)h.fifoResetFailures,
+    (unsigned long)h.recoveryLimitHits, h.pausedMode, h.resetWrite,
+    h.resetOverflow, h.resetRead, h.resumedMode);
+#endif
+}
+
+void sendBleHealth(String requestId) {
+  MeshHealthSnapshot health = healthSensor.snapshot();
+  uint32_t now = millis();
+  bool samplesFresh = health.sampleSeen && uint32_t(now - health.lastSampleAt) <= 500;
+  bool fresh = health.enabled && health.present && health.contact && samplesFresh &&
+    health.valueSeen && uint32_t(now - health.lastValueAt) <= 2500;
+  StaticJsonDocument<2048> doc;
+  addTelemetryFields(doc);
+  doc["type"] = "health";
+  doc["nodeId"] = nodeId;
+  doc["requestId"] = requestId.substring(0, 64);
+  doc["supported"] = bool(MESH_HAS_MAX30102);
+  doc["enabled"] = health.enabled;
+  doc["present"] = health.present;
+  doc["experimental"] = true;
+  doc["diagnosticRevision"] = 3;
+  doc["state"] = health.state;
+  doc["contact"] = health.contact && samplesFresh;
+  doc["heartRateValid"] = fresh && health.heartValid;
+  doc["spo2Valid"] = fresh && health.spo2Valid;
+  if (fresh && health.heartValid) doc["heartRateBpm"] = health.heartRate;
+  if (fresh && health.spo2Valid) doc["spo2Percent"] = health.spo2;
+  doc["ageMs"] = health.valueSeen ? long(uint32_t(now - health.lastValueAt)) : -1L;
+  doc["sampleAgeMs"] = health.sampleSeen ? long(uint32_t(now - health.lastSampleAt)) : -1L;
+  if (health.enabled && samplesFresh) {
+    doc["red"] = health.red;
+    doc["infrared"] = health.infrared;
+  }
+  doc["windowSamples"] = health.windowSamples;
+  doc["samplesReceived"] = health.samples;
+  doc["fifoResets"] = health.fifoResets;
+  doc["i2cErrors"] = health.i2cErrors;
+  doc["sdaPin"] = MESH_MAX_SDA_PIN;
+  doc["sclPin"] = MESH_MAX_SCL_PIN;
+  doc["configAttempts"] = health.configAttempts;
+  doc["configFailures"] = health.configFailures;
+  doc["ambientOverflows"] = health.ambientOverflows;
+  doc["fifoOverflows"] = health.fifoOverflows;
+  doc["sampleTimeouts"] = health.sampleTimeouts;
+  doc["sampleGaps"] = health.sampleGaps;
+  doc["powerEvents"] = health.powerEvents;
+  doc["fifoResetsVerified"] = health.fifoResetsVerified;
+  doc["fifoResetFailures"] = health.fifoResetFailures;
+  doc["recoveryLimitHits"] = health.recoveryLimitHits;
+  doc["lastFault"] = health.lastFault;
+  doc["lastFaultAt"] = health.lastFaultAt;
+  doc["lastI2cOperation"] = health.lastI2cOperation;
+  doc["lastI2cRegister"] = health.lastI2cRegister;
+  doc["lastI2cCode"] = health.lastI2cCode;
+  doc["lastI2cExpected"] = health.lastI2cExpected;
+  doc["lastI2cReceived"] = health.lastI2cReceived;
+  doc["partId"] = health.partId;
+  doc["modeRegister"] = health.modeRegister;
+  doc["configRegister"] = health.configRegister;
+  doc["fifoConfigRegister"] = health.fifoConfigRegister;
+  doc["statusRegister"] = health.statusRegister;
+  doc["fifoWrite"] = health.fifoWrite;
+  doc["fifoOverflow"] = health.fifoOverflow;
+  doc["fifoRead"] = health.fifoRead;
+  doc["resetWrite"] = health.resetWrite;
+  doc["resetOverflow"] = health.resetOverflow;
+  doc["resetRead"] = health.resetRead;
+  doc["pausedMode"] = health.pausedMode;
+  doc["resumedMode"] = health.resumedMode;
+  if (doc.overflowed()) {
+    // Fail closed: do not send an incomplete physiological snapshot.
+    bleNotifyEvent("error", "Health JSON capacity exceeded");
+    return;
+  }
+  String payload;
+  serializeJson(doc, payload);
+  bleNotifyLine(payload);
+  // Deliberately no health values on the automatic serial status or LoRa.
+}
+
+bool handleHealthCommand(StaticJsonDocument<768> &doc) {
+  String cmd = doc["cmd"] | "";
+  if (cmd != "health" && cmd != "setHealth") return false;
+  if (cmd == "setHealth") {
+    if (!MESH_HAS_MAX30102 || !doc["enabled"].is<bool>() ||
+        !healthSensor.setEnabled(doc["enabled"].as<bool>())) {
+      bleNotifyEvent("error", "MAX30102 no disponible o enabled invalido");
+      return true;
+    }
+  }
+  sendBleHealth(doc["requestId"] | "");
+  return true;
+}
+
+bool handleGpsCommand(StaticJsonDocument<768> &doc) {
+  String cmd = doc["cmd"] | "";
+  if (cmd != "gps" && cmd != "setGps") return false;
+  if (cmd == "setGps") {
+    if (!MESH_HAS_GPS || !doc["enabled"].is<bool>()) {
+      bleNotifyEvent("error", "GPS no soportado o enabled no es booleano");
+      return true;
+    }
+    setGpsEnabled(doc["enabled"].as<bool>());
+  }
+  sendBleGps(doc["requestId"] | "");
+  return true;
+}
+
 void handleJsonCommand(String input) {
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   DeserializationError error = deserializeJson(doc, input);
 
   if (error) {
@@ -2059,6 +2605,8 @@ void handleJsonCommand(String input) {
 
   String cmd = doc["cmd"] | "";
 
+  if (handleGpsCommand(doc)) return;
+  if (handleHealthCommand(doc)) return;
   if (cmd == "info") {
     Serial.println("[INFO] Node ID: " + nodeId);
     Serial.println("[INFO] Node Name: " + nodeName);
@@ -2076,31 +2624,37 @@ void handleJsonCommand(String input) {
   } else if (cmd == "broadcast") {
     String data;
     bool encrypted;
-    if (!extractCommandPayload(doc, data, encrypted)) return;
+    SecurityTxMetrics securityMetrics;
+    if (!extractCommandPayload(doc, data, encrypted, securityMetrics)) return;
     bool sos = doc["sos"] | false;
-    sendMeshPayloadAuto("broadcast", data, encrypted, sos);
+    sendMeshPayloadAuto("broadcast", data, encrypted, sos, securityMetrics);
   } else if (cmd == "sendDirect") {
     String to = doc["to"] | "broadcast";
     String data;
     bool encrypted;
-    if (!extractCommandPayload(doc, data, encrypted)) return;
+    SecurityTxMetrics securityMetrics;
+    if (!extractCommandPayload(doc, data, encrypted, securityMetrics)) return;
     bool sos = doc["sos"] | false;
-    sendMeshPayloadDirect(to, data, encrypted, sos);
+    sendMeshPayloadDirect(to, data, encrypted, sos, securityMetrics);
   } else if (cmd == "send") {
     String to = doc["to"] | "broadcast";
     String data;
     bool encrypted;
-    if (!extractCommandPayload(doc, data, encrypted)) return;
+    SecurityTxMetrics securityMetrics;
+    if (!extractCommandPayload(doc, data, encrypted, securityMetrics)) return;
     bool sos = doc["sos"] | false;
-    sendMeshPayloadAuto(to, data, encrypted, sos);
+    sendMeshPayloadAuto(to, data, encrypted, sos, securityMetrics);
   } else if (cmd == "sendvia") {
     String relay = doc["relay"] | "";
     String to = doc["to"] | "";
     String data;
     bool encrypted;
-    if (!extractCommandPayload(doc, data, encrypted)) return;
+    SecurityTxMetrics securityMetrics;
+    if (!extractCommandPayload(doc, data, encrypted, securityMetrics)) return;
     bool sos = doc["sos"] | false;
-    sendMeshPayloadVia(relay, to, data, encrypted, sos);
+    sendMeshPayloadVia(relay, to, data, encrypted, sos, securityMetrics);
+  } else if (cmd == "cryptoMetric") {
+    recordDecryptionMetric(doc);
   } else {
     Serial.println("[CMD] Comando JSON desconocido: " + cmd);
   }
@@ -2113,21 +2667,16 @@ void dispatchBleCommand(String input) {
     return;
   }
 
-  bleCommandsReceived++;
-  lastBleCommand = input.substring(0, 80);
-
-  Serial.println();
-  Serial.println("[BLE] Comando completo recibido:");
-  Serial.println(input);
-
-  handleBleCommand(input);
+  MeshCommand queued = {};
+  input.toCharArray(queued.text, sizeof(queued.text));
+  if (!commandQueue || xQueueSend(commandQueue, &queued, 0) != pdTRUE) commandQueueOverflow = true;
 }
 
 void handleBleWriteChunk(String chunk) {
   if (bleCommandBuffer.length() + chunk.length() > MAX_BLE_COMMAND_BYTES) {
     bleCommandBuffer = "";
     Serial.println("[BLE] Comando descartado: buffer excedido");
-    bleNotifyEvent("error", "Comando BLE demasiado grande");
+    commandBufferOverflow = true;
     return;
   }
 
@@ -2175,7 +2724,7 @@ void handleBleCommand(String input) {
     return;
   }
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   DeserializationError error = deserializeJson(doc, input);
 
   if (error) {
@@ -2186,7 +2735,9 @@ void handleBleCommand(String input) {
   }
 
   String cmd = doc["cmd"] | "";
-
+  MeshRequestScope requestScope(String(doc["requestId"] | ""));
+  if (handleGpsCommand(doc)) return;
+  if (handleHealthCommand(doc)) return;
   if (cmd == "info") {
     sendBleInfo();
   } else if (cmd == "status") {
@@ -2203,31 +2754,37 @@ void handleBleCommand(String input) {
   } else if (cmd == "broadcast") {
     String data;
     bool encrypted;
-    if (!extractCommandPayload(doc, data, encrypted)) return;
+    SecurityTxMetrics securityMetrics;
+    if (!extractCommandPayload(doc, data, encrypted, securityMetrics)) return;
     bool sos = doc["sos"] | false;
-    sendMeshPayloadAuto("broadcast", data, encrypted, sos);
+    sendMeshPayloadAuto("broadcast", data, encrypted, sos, securityMetrics);
   } else if (cmd == "sendDirect") {
     String to = doc["to"] | "broadcast";
     String data;
     bool encrypted;
-    if (!extractCommandPayload(doc, data, encrypted)) return;
+    SecurityTxMetrics securityMetrics;
+    if (!extractCommandPayload(doc, data, encrypted, securityMetrics)) return;
     bool sos = doc["sos"] | false;
-    sendMeshPayloadDirect(to, data, encrypted, sos);
+    sendMeshPayloadDirect(to, data, encrypted, sos, securityMetrics);
   } else if (cmd == "send") {
     String to = doc["to"] | "broadcast";
     String data;
     bool encrypted;
-    if (!extractCommandPayload(doc, data, encrypted)) return;
+    SecurityTxMetrics securityMetrics;
+    if (!extractCommandPayload(doc, data, encrypted, securityMetrics)) return;
     bool sos = doc["sos"] | false;
-    sendMeshPayloadAuto(to, data, encrypted, sos);
+    sendMeshPayloadAuto(to, data, encrypted, sos, securityMetrics);
   } else if (cmd == "sendvia") {
     String relay = doc["relay"] | "";
     String to = doc["to"] | "";
     String data;
     bool encrypted;
-    if (!extractCommandPayload(doc, data, encrypted)) return;
+    SecurityTxMetrics securityMetrics;
+    if (!extractCommandPayload(doc, data, encrypted, securityMetrics)) return;
     bool sos = doc["sos"] | false;
-    sendMeshPayloadVia(relay, to, data, encrypted, sos);
+    sendMeshPayloadVia(relay, to, data, encrypted, sos, securityMetrics);
+  } else if (cmd == "cryptoMetric") {
+    recordDecryptionMetric(doc);
   } else {
     bleNotifyEvent("error", "Comando BLE desconocido: " + cmd);
     Serial.println("[BLE] Comando desconocido: " + cmd);
@@ -2246,6 +2803,35 @@ void handleSerialCommand(String input) {
 
   if (input == "help") {
     printHelp();
+    return;
+  }
+
+  if (input == "gps") { sendBleGps(); return; }
+  if (input == "health") {
+    sendBleHealth();
+    printHealthDiagnostics();
+    return;
+  }
+#if MESH_HAS_MAX30102
+  if (input == "health diag on" || input == "health diag off") {
+    healthDiagnosticSerial = input == "health diag on";
+    Serial.printf("[HEALTH-DIAG r3] stream=%s (solo diagnostico; no activa el sensor)\n",
+      healthDiagnosticSerial ? "on" : "off");
+    printHealthDiagnostics();
+    return;
+  }
+#endif
+  if (input == "health on" || input == "health off") {
+    if (!healthSensor.setEnabled(input == "health on")) {
+      Serial.println("[HEALTH] MAX30102 no disponible en este perfil");
+    }
+    sendBleHealth();
+    return;
+  }
+  if (input == "gps on" || input == "gps off") {
+    if (!MESH_HAS_GPS) { Serial.println("[GPS] Perfil V3 sin GPS"); return; }
+    setGpsEnabled(input == "gps on");
+    sendBleGps();
     return;
   }
 
@@ -2407,9 +2993,58 @@ void handleSerialCommand(String input) {
 }
 
 void handleSerialInput() {
-  if (Serial.available()) {
-    String input = Serial.readStringUntil('\n');
-    handleSerialCommand(input);
+  static String serialBuffer;
+  static bool discard = false;
+  unsigned budget = 256;
+  while (budget-- && Serial.available()) {
+    char c = char(Serial.read());
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (!discard) handleSerialCommand(serialBuffer);
+      serialBuffer = "";
+      discard = false;
+    } else if (!discard) {
+      if (serialBuffer.length() < MAX_BLE_COMMAND_BYTES) serialBuffer += c;
+      else { serialBuffer = ""; discard = true; Serial.println("[CMD] Linea demasiado larga"); }
+    }
+  }
+}
+
+void initBoardHardware() {
+#if MESH_HAS_GPS
+  pinMode(MESH_FEM_POWER_PIN, OUTPUT);
+  digitalWrite(MESH_FEM_POWER_PIN, HIGH);
+  pinMode(MESH_FEM_ENABLE_PIN, OUTPUT);
+  digitalWrite(MESH_FEM_ENABLE_PIN, HIGH);
+  pinMode(MESH_FEM_MODE_PIN, OUTPUT);
+  digitalWrite(MESH_FEM_MODE_PIN, LOW);
+  delay(2); // Power the FEM before SX1262 image calibration.
+#endif
+  uint8_t *storage = nullptr;
+#if MESH_HAS_GPS
+  storage = static_cast<uint8_t *>(heap_caps_malloc(
+    MESH_COMMAND_QUEUE_SIZE * sizeof(MeshCommand), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+#endif
+  if (storage) commandQueue = xQueueCreateStatic(MESH_COMMAND_QUEUE_SIZE, sizeof(MeshCommand), storage, &commandQueueControl);
+  else commandQueue = xQueueCreate(MESH_COMMAND_QUEUE_SIZE, sizeof(MeshCommand));
+  if (!commandQueue) {
+    Serial.println("[SYS] ERROR: no se pudo reservar la cola BLE");
+    while (true) delay(1000);
+  }
+}
+
+void processQueuedCommand() {
+  if (commandQueueOverflow || commandBufferOverflow) {
+    commandQueueOverflow = commandBufferOverflow = false;
+    ++commandQueueDrops;
+    bleNotifyEvent("txError", "Cola BLE llena o comando demasiado grande; vuelve a intentar");
+  }
+  MeshCommand queued;
+  if (xQueueReceive(commandQueue, &queued, 0) == pdTRUE) {
+    ++bleCommandsReceived;
+    // Do not log decrypted text, coordinates, ciphertext, or crypto keys.
+    lastBleCommand = "Comando BLE procesado";
+    handleBleCommand(String(queued.text));
   }
 }
 
@@ -2423,12 +3058,22 @@ void setup() {
   Serial.println();
   Serial.println("=================================");
   Serial.println("CAPA 5.1 - BLE APP + MULTIHOP AUTOMATICO + ACK");
-  Serial.println("RadioLib + Heltec WiFi LoRa 32 V3");
+  Serial.println(String("MeshLink 5.6.0 / RadioLib + ") + MESH_BOARD_NAME);
+#if MESH_HAS_MAX30102
+  Serial.println("[HEALTH-DIAG r3] MAX30102 FIFO r2 + metadatos BLE para registro local; sin envio automatico LoRa");
+#endif
   Serial.println("Sin Mcu.begin / Sin licencia Heltec");
   Serial.println("=================================");
 
   initOled();
   setupIdentity();
+  char bootBuffer[33];
+  snprintf(bootBuffer, sizeof(bootBuffer), "%08lx%08lx%08lx%08lx",
+    (unsigned long)esp_random(), (unsigned long)esp_random(),
+    (unsigned long)esp_random(), (unsigned long)esp_random());
+  bootId = bootBuffer;
+  initBoardHardware();
+  setGpsEnabled(MESH_HAS_GPS && prefs.getBool("gpsEnabled", true));
   initBle();
   randomSeed((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF));
   scheduleNextAnnounce();
@@ -2447,7 +3092,8 @@ void setup() {
     LORA_CR,
     LORA_SYNC_WORD,
     LORA_POWER,
-    LORA_PREAMBLE
+    LORA_PREAMBLE,
+    MESH_TCXO_VOLTAGE
   );
 
   if (state == RADIOLIB_ERR_NONE) {
@@ -2464,20 +3110,28 @@ void setup() {
   }
 
   radio.setDio1Action(setFlag);
+  // DIO2 drives the onboard RF switch / FEM TX-RX selection on V3 and V4.
+  state = radio.setDio2AsRfSwitch(true);
+  if (state != RADIOLIB_ERR_NONE) Serial.printf("[LoRa] RF switch error: %d\n", state);
   startReceiveMode();
 
+  healthSensor.begin(); // OFF at every boot, even if it was enabled previously.
   Serial.println("[SYS] Setup completo");
   printHelp();
   updateDisplay();
 }
 
 void loop() {
+  pollGps();
   if (receivedFlag) {
     handleReceivedPacket();
   }
 
   handleSerialInput();
   checkAckTimeouts();
+  // Handle at most one queued BLE frame per pass, after pending radio RX.
+  processQueuedCommand();
+  pollGps();
 
   if (bleConnected != oldBleConnected) {
     oldBleConnected = bleConnected;
@@ -2487,10 +3141,29 @@ void loop() {
       sendBleInfo();
       sendBleNodes();
       sendBleStatus();
+      sendBleGps();
+      sendBleHealth();
     }
   }
 
   unsigned long now = millis();
+#if MESH_HAS_MAX30102
+  static unsigned long lastHealthDiagnosticAt = 0;
+  if (healthDiagnosticSerial && uint32_t(now - lastHealthDiagnosticAt) >= 2000) {
+    lastHealthDiagnosticAt = now;
+    printHealthDiagnostics();
+  }
+#endif
+  static unsigned long lastHealthAt = 0;
+  if (bleConnected && MESH_HAS_MAX30102) {
+    // Full diagnostics only need 1 Hz while acquiring. Avoid increasing idle
+    // BLE framing load during network trials when the sensor is disabled.
+    const uint32_t interval = healthSensor.snapshot().enabled ? 1000 : 10000;
+    if (uint32_t(now - lastHealthAt) >= interval) {
+      lastHealthAt = now;
+      sendBleHealth();
+    }
+  }
 
   if ((long)(now - nextAnnounceAt) >= 0) {
     bool quietAfterTx = (now - lastPriorityTxAt) > TX_GUARD_AFTER_MESSAGE_MS;
@@ -2517,6 +3190,7 @@ void loop() {
     if (bleConnected && millis() - lastBleStatusAt >= BLE_STATUS_INTERVAL_MS) {
       lastBleStatusAt = millis();
       sendBleStatus();
+      sendBleGps();
     }
   }
 }

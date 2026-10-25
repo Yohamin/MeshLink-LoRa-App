@@ -25,6 +25,16 @@ export default function NetworkScreen() {
       <Text style={styles.eyebrow}>ESTADO DE LA RADIO</Text>
       <Text style={styles.title}>Red</Text>
       <ConnectionPill />
+      <TouchableOpacity style={styles.protocolCard} onPress={() => router.push("/health-measurements")} accessibilityRole="button">
+        <Ionicons name="pulse-outline" size={24} color={Colors.primary} />
+        <View style={styles.protocolCopy}><Text style={styles.protocolTitle}>Apoyo en emergencias</Text>
+          <Text style={styles.protocolText}>MAX30102 · Estado declarado, mediciones e informes para coordinar ayuda.</Text></View>
+      </TouchableOpacity>
+      <TouchableOpacity style={styles.protocolCard} onPress={() => router.push("/field-tests")} accessibilityRole="button">
+        <Ionicons name="flask-outline" size={24} color={Colors.primary} />
+        <View style={styles.protocolCopy}><Text style={styles.protocolTitle}>Ensayos · emisor y receptor</Text>
+          <Text style={styles.protocolText}>100 mensajes · historial · exportación CSV / JSON</Text></View>
+      </TouchableOpacity>
 
       {connectionState !== "connected" ? (
         <TouchableOpacity style={styles.connectCard} onPress={() => router.push("/connect")}>
