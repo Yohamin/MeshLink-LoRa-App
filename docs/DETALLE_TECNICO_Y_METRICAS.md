@@ -8,6 +8,18 @@ Fecha de documentación: **25 de octubre de 2026**.
 | Firmware | 5.6.0 |
 | Protocolo LoRa propio | 5.1 |
 
+Actualización GPS, 2 de noviembre de 2026: el firmware actual es **5.6.1**.
+El perfil `V4_3` usa RX39 sin TX y arranque no bloqueante con pull-ups débiles,
+según la prueba NMEA del kit L76K. V3 y las definiciones de métricas permanecen
+sin cambios. Se añade `firmware/gps_hardware.h`; ver [detalle y carga](V4_GPS.md).
+La tabla anterior identifica la base 5.6.0 de esta documentación técnica.
+
+Actualización de app, 4 de noviembre de 2026: **1.4.2 / código Android 12**
+añade captura automática de 100 instantáneas BLE del MAX, progreso y resúmenes
+de validez por canal. El conteo incluye instantáneas inválidas, excluye eventos
+de envío y conserva el modo manual. Firmware, radio y muestreo óptico no
+cambian. Ver [procedimiento y exportación](MEDICIONES_MAX30102.md).
+
 Este documento describe el código y las dependencias revisadas en el proyecto. Distingue **lo que mide el radio**, **lo que contabiliza el firmware** y **lo que calcula la aplicación**.
 
 Las versiones instaladas de herramientas y librerías corresponden al entorno local revisado. No son una recomendación de actualización ni garantizan que otro equipo tenga las mismas versiones.

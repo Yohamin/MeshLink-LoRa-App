@@ -1,4 +1,9 @@
-# Apoyo en emergencias · MAX30102 — app 1.4.1 / código 11 y firmware 5.6.0
+# Apoyo en emergencias · MAX30102 — app 1.4.2 / código 12 y firmware 5.6.1
+
+Firmware 5.6.1 corrige únicamente el GPS del kit V4_3 probado; mantiene la
+adquisición MAX30102. La corrección GPS por sí sola no requiere un nuevo APK;
+el modo de captura de 100 instantáneas sí requiere instalar la app 1.4.2.
+Ver [GPS](V4_GPS.md).
 
 ## Estado y alcance
 
@@ -24,7 +29,7 @@ correctamente; la revisión de interfaz 1.4.1 también tiene APK ARM64 compilado
 localmente. Los binarios no se incluyen en el repositorio de fuentes.
 No se ha validado clínicamente, ni se han hecho envíos físicos de esta función.
 
-## Interfaz de apoyo (1.4.1)
+## Interfaz de apoyo (1.4.2)
 
 Primero se elige el estado declarado, sin selección automática a partir del
 pulso o la SpO₂. «Necesito ayuda» destaca la solicitud SOS, pero seleccionarlo
@@ -52,7 +57,7 @@ cd "C:\Users\Yohamin\Documents\Codex\2026-08-08\u\MeshLink-LoRa-App"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\generar-paquete-experimental.ps1
 ```
 
-El script utiliza las nuevas versiones 1.4.1 / 5.6.0, comprueba software,
+El script utiliza las versiones actuales de `app.json` / firmware 5.6.1, comprueba software,
 compila V3 y V4_3 y prepara APK, firmware y guías en una carpeta nueva. No
 instala el APK ni carga placas. Solo usar un paquete con marcador de
 compilación completa, no una carpeta de validación software.
@@ -61,10 +66,10 @@ Para compilar y cargar únicamente la V4.3.1 si sigue en COM4, cerrar antes
 el monitor serie y mantener la antena LoRa conectada:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-firmware.ps1 -Board V4_3 -Jobs 4 -ConfigFile "C:\Users\Yohamin\.arduinoIDE\arduino-cli.yaml" -OutputDirectory "$PWD\firmware\build\V4_3-5.6.0" -Port COM4
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-firmware.ps1 -Board V4_3 -Jobs 4 -ConfigFile "C:\Users\Yohamin\.arduinoIDE\arduino-cli.yaml" -OutputDirectory "$PWD\firmware\build\V4_3-5.6.1" -Port COM4
 ```
 
-Comprobar `MeshLink 5.6.0` y `[HEALTH-DIAG r3]` al arrancar. No necesita
+Comprobar `MeshLink 5.6.1` y `[HEALTH-DIAG r3]` al arrancar. No necesita
 modificar la alimentación, pines, puentes del breakout ni corriente LED.
 Instalar app 1.4.1 en ambos teléfonos para interpretar «Tengo molestias»
 (código `M` en H1). Se mantienen los códigos N/A/B de 1.4.0. Un receptor
@@ -79,10 +84,25 @@ mensajería previo compatible puede transportar ese texto sin interpretarlo.
 2. Activar «Leer sensor del nodo». Sigue apagado en cada reinicio.
 3. Usar un código/alias de participante, evitando nombres personales cuando
    no sean necesarios. Obtener su autorización antes de registrar/compartir.
-4. Pulsar «Iniciar registro con consentimiento» y aceptar el aviso de datos
-   sensibles. No se registra por permanecer conectado ni por ver Ajustes.
-5. Mantener la pantalla visible y la app en primer plano. Finalizar el
+4. Elegir «Capturar 100 instantáneas» (seleccionado inicialmente) o desactivarlo
+   para el registro manual. Pulsar «Iniciar registro con consentimiento» y
+   aceptar el aviso de datos sensibles. No se registra por permanecer
+   conectado ni por ver Ajustes.
+5. En modo 100, mantener la pantalla visible hasta ver «Completada: 100/100
+   instantáneas». Cuenta todas las instantáneas `sample`, incluidas las
+   inválidas; los eventos de envío no cuentan. Dura aproximadamente 100 s,
+   según las notificaciones BLE; no es un temporizador ni exige 100 lecturas
+   válidas. Una interrupción se muestra como «Interrumpida: n/100».
+6. Mantener la pantalla visible y la app en primer plano. Finalizar el
    registro no apaga automáticamente el sensor; utilizar su interruptor.
+
+El resumen presenta pulso válido, SpO₂ válida y ambos válidos sobre todas
+las instantáneas guardadas. JSON incluye `summary` y objetivo/conteo; CSV
+añade `captureMode`, `targetSamples`, `sampleIndex`, `sessionSampleCount`,
+`sessionStatus`, `sessionEndReason`, `sessionStartedAt` y `sessionEndedAt`.
+Un fallo de persistencia conserva los registros rescatables sin indicar
+captura completada. Los historiales anteriores siguen disponibles como
+manuales. El modo no modifica la adquisición ni exige cargar firmware nuevo.
 
 Salir de la pantalla, pasar a segundo plano/bloquear, perder BLE, apagar el
 sensor, cambiar de nodo/arranque o detectar retroceso de uptime finaliza el
@@ -162,6 +182,17 @@ borrado forense. Desinstalar/borrar datos de la app puede perder el historial.
 
 ## Verificación
 
+App 1.4.2 (4/11/2026): TypeScript, **50 pruebas Node** y exportación web de
+**15 rutas** verificados. Se añadieron casos de objetivo exacto con capturas
+en cola, valores inválidos, eventos de envío, interrupciones, fallos de
+almacenamiento, resúmenes/exportación y recuperación de historiales previos.
+El 5/11 se verificaron seis CSV físicos de 100 instantáneas, índices completos
+y cierre automático por objetivo. Quedan pendientes las pruebas físicas de
+interrupciones, JSON, reapertura tras reinicio y envío entre dos teléfonos.
+APK release ARM64 1.4.2 / código 12 compilado correctamente; `aapt` y
+`apksigner verify` comprobaron versión, arquitectura y firma. No instalado
+automáticamente. Véase la ficha del [APK y su hash](continuidad/02_APLICACION.md).
+
 La base 1.4.0 / 5.6.0 cuenta con paquete nativo compilado y pruebas software.
 La revisión 1.4.1 añade pruebas de calidad técnica, estado declarado, código M
 cifrado y conservación en CSV/JSON. La prueba física de envío/registro sigue
@@ -196,7 +227,7 @@ codec canónico de 32 bytes, cifrado GCM real con manipulación rechazada,
 cancelación/caducidad y comprobación de clave al salir de la cola. La prueba
 de cifrado simula el payload, no dos radios/teléfonos físicos.
 
-Pendiente en hardware: instalar APK 1.4.1 en ambos teléfonos, cargar 5.6 en V4,
+Pendiente en hardware: probar APK 1.4.2 con el firmware 5.6.1 ya compatible,
 registrar/recuperar/exportar una sesión, compartir directo y broadcast,
 comprobar cancelación y reconexión, y verificar que una lectura inválida
 nunca aparezca como evaluación médica de una persona.

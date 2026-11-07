@@ -47,11 +47,26 @@
 #define MESH_GPS_WAKE_PIN 40
 #endif
 // ESP32 UART direction, not the direction named on the GPS module.
+// V4.3/4.3.1 + L76K kit: GPS-DIAG r2 observed valid NMEA on ESP RX39/9600.
+// This evidence is specific to that kit; do not change V4.2/R8 blindly.
 #ifndef MESH_GPS_RX_PIN
+#if MESH_BOARD_PROFILE == 43
+#define MESH_GPS_RX_PIN 39
+#else
 #define MESH_GPS_RX_PIN 38
 #endif
+#endif
 #ifndef MESH_GPS_TX_PIN
+#if MESH_BOARD_PROFILE == 43
+#define MESH_GPS_TX_PIN -1 // Listen only: never drive the receiver's TX line.
+#else
 #define MESH_GPS_TX_PIN 39
+#endif
+#endif
+static_assert(MESH_GPS_TX_PIN < 0 || MESH_GPS_RX_PIN != MESH_GPS_TX_PIN,
+              "GPS RX and TX cannot share a pin.");
+#if MESH_BOARD_PROFILE == 43
+static_assert(MESH_GPS_TX_PIN == -1, "V4.3 L76K profile is listen-only; keep GPS TX disabled.");
 #endif
 #else
 #error "Unsupported MeshLink board profile."

@@ -1,8 +1,30 @@
 # MeshLink
 
+Para retomar el trabajo en otro chat: [índice de continuidad en español](docs/continuidad/00_LEEME.md),
+[estado actual](docs/continuidad/01_CONTEXTO_Y_ESTADO_ACTUAL.md) y
+[mensaje de inicio](docs/continuidad/INICIAR_NUEVO_CHAT.md).
+La continuidad distingue fuente local, versión publicada y evidencia de pruebas.
+
 MeshLink is an offline-first emergency messenger for the Heltec WiFi LoRa 32 V3/V4 using firmware protocol 5.1. A phone connects to its local ESP32 over BLE, while direct, broadcast, and automatic relay messages travel over LoRa.
 
-## Emergency support — app 1.4.1 / firmware 5.6.0
+## Emergency support — app 1.4.2 / firmware 5.6.1
+
+App 1.4.2 (Android code 12) adds automatic recording of exactly 100 MAX
+BLE snapshots, including invalid readings, with progress, persisted stopping,
+per-channel availability summaries and CSV/JSON metadata. Sharing events do
+not count toward the target. Manual recording and previous histories remain
+available. Firmware acquisition is unchanged. Install the updated APK to use
+this mode. Six physical CSV sessions with 100 snapshots and automatic target
+completion were verified on November 5; interruption/restart/JSON acceptance
+and physical two-phone sharing checks remain pending.
+
+Firmware 5.6.1 corrects the tested V4.3/4.3.1 L76K kit to receive on GPIO39
+with UART TX disabled, and uses a non-blocking power/reset sequence with weak
+control pull-ups. V3 behavior and the LoRa/BLE protocol remain unchanged;
+the existing 1.4.1 APK can be used. See [GPS correction and upload](docs/V4_GPS.md).
+Valid NMEA was observed with the standalone diagnostic, and the user reported
+working GPS after the fix. A formal main-firmware position log and full
+physical acceptance checks remain to be recorded.
 
 Local opt-in sessions, CSV/JSON export and manually confirmed encrypted
 direct/broadcast reports are implemented. The screen prioritizes the person's
@@ -10,10 +32,15 @@ declared condition (needs help, discomfort, feels well), measurement availabilit
 and manually confirmed sharing. See [Mediciones MAX30102](docs/MEDICIONES_MAX30102.md)
 for build steps, consent, storage limits and physical validation still required.
 This experimental device does not classify a person as medically well/unwell.
-The 1.4.1 ARM64 APK has been compiled locally; physical two-phone acceptance
-testing remains pending. APKs, firmware binaries, build caches and local signing
+The 1.4.2 ARM64 release APK has been compiled locally and its version/code
+and signature verified. Six physical MAX captures have been checked; further
+lifecycle and two-phone acceptance testing remains pending. APKs, firmware binaries, build caches and local signing
 keys are excluded from this source repository. Build instructions are below.
-Update both phones to 1.4.1 to interpret the new discomfort declaration.
+Use app 1.4.1 or later on both phones to interpret the discomfort declaration;
+the new automatic MAX capture requires 1.4.2 on the recording phone.
+
+Prototype enclosure and PCB options remain proposals; see the
+[current hardware design decisions](docs/continuidad/07_PROTOTIPO_Y_PCB.md).
 
 For libraries, resolved versions and exact metric definitions, see
 [Detalle técnico y métricas](docs/DETALLE_TECNICO_Y_METRICAS.md).

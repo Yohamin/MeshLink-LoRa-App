@@ -1,5 +1,12 @@
 # Preparar el paquete y realizar la parte experimental
 
+> Guía histórica de la introducción de Ensayos (app 1.3.0 / firmware 5.5.0).
+> Las versiones fuente actuales son app 1.4.2 / firmware 5.6.1. Consultar
+> [continuidad](continuidad/00_LEEME.md), [ensayos](continuidad/05_ENSAYOS_Y_METRICAS.md)
+> y [carga V4/GPS](V4_GPS.md) antes de usar comandos o paquetes anteriores.
+> Los nombres/versiones y limitaciones de compilación descritos abajo son de
+> aquella etapa, no una validación del paquete actual.
+
 Versiones previstas: **MeshLink 1.3.0, código 9, ARM64** y **firmware 5.5.0**
 para **Heltec V3** y **V4.3 / V4.3.1 KCT8103L**. No usar esos binarios V4
 en V4.2/GC1109 o V4-R8. El paquete usa firma de prueba, no firma de producción.

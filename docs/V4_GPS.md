@@ -1,4 +1,73 @@
-# MeshLink 5.2: red mixta Heltec V3 / V4 con GPS
+# MeshLink: red mixta Heltec V3 / V4 con GPS
+
+## Corrección GPS 5.6.1 para el kit V4.3/4.3.1 probado
+
+El registro físico de GPS-DIAG r2 proporcionado por el usuario recibió NMEA
+válido en **GPIO39 a 9600 baudios**: 2222 bytes y 79 sentencias al terminar
+esa etapa; después continuó hasta 4447 bytes y 159 sentencias, sin rechazos.
+Las cinco etapas de GPIO38 recibieron cero bytes. Esto confirma comunicación
+en el conjunto probado, **no fijación satelital ni el pinout de todos los kits**.
+
+El firmware **5.6.1**, perfil **V4_3**, aplica:
+
+- RX del ESP32 **GPIO39**, TX UART **deshabilitado (-1)**. No conducir la
+  línea por la que transmite el GPS. No intercambiar cables físicamente.
+- Alimentación GPIO34 activa baja; WAKE40 y RESET42 liberados como
+  `INPUT_PULLUP`, sin salida HIGH fuerte contra una carga desconocida.
+- Secuencia del diagnóstico: OFF 600 ms, ON/estabilización 1000 ms, reset
+  open-drain LOW 250 ms y espera de 1200 ms antes de iniciar UART. Es una
+  máquina de estados sin `delay()`, atendida desde `pollGps()`; el bucle sigue
+  atendiendo LoRa, BLE y MAX. Si el bucle se retrasa, las guardas se alargan.
+- Al apagar GPS: UART detenida, entradas de control sin pull-ups y alimentación
+  ordenada OFF. Al reiniciar se respeta la preferencia GPS guardada.
+- V3 continúa sin GPS de nodo ni cambios de radio/sensor. V4.2 y V4-R8
+  conservan su mapeo anterior; no se extrapola el resultado a esas variantes.
+- Protocolo LoRa 5.1, UUID BLE, MAX30102 y formato GPS BLE sin cambios.
+  **La aplicación 1.4.1 existente no necesita otro APK por esta corrección.**
+
+No cargar el binario viejo 5.6.0 sobre este kit para probar GPS: configuraba
+GPIO39 como TX del ESP32. No usar el binario de GPS-DIAG como firmware MeshLink.
+
+### Cargar y comprobar
+
+Conectar la antena LoRa antes de encender MeshLink. Confirmar el puerto actual
+y cerrar el monitor serie. Desde la raíz, **solo si el puerto sigue siendo COM4**:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-firmware.ps1 -Board V4_3 -Jobs 2 -ConfigFile "C:\Users\Yohamin\.arduinoIDE\arduino-cli.yaml" -Port COM4
+```
+
+Este comando compila y carga; no borra toda la flash. Omitir `-Port` solo compila.
+Abrir monitor a 115200 y verificar `MeshLink 5.6.1` y, tras el arranque del GPS:
+
+```text
+[GPS-UART r3] rx=39 tx=-1 baud=9600 uart=1 controls=weak-pullup
+```
+
+Si se conservó la preferencia OFF, enviar `gps on`. Esperar al menos cinco
+segundos y enviar `gps`; repetirlo unos segundos después. `bytes` y `nmea_ok`
+deben aumentar para confirmar comunicación. `uart=1` por sí solo solo confirma
+el driver, no el receptor. Para coordenadas se necesita además `fix=1`; hacer
+esa prueba al aire libre con cielo despejado. No reutilizar una posición antigua.
+
+El usuario confirmó el 3/11 que el GPS funciona bien después de la corrección.
+El registro UART identificado corresponde al diagnóstico aislado. Para una
+aceptación formal del principal, conservar versión y registro de posición;
+comprobar también mensajería V3/V4, encendido/apagado GPS, reinicio y MAX.
+
+### Verificación local de 5.6.1 (2 de noviembre de 2026)
+
+- Compilación nativa V3 correcta: programa 770183 bytes; RAM estática 33132 bytes.
+- Compilación nativa V4_3 correcta: programa 798489 bytes; RAM estática 37956 bytes.
+- Binarios en `firmware/build/V3/` y `firmware/build/V4_3/`; se comprobó la
+  presencia de versión 5.6.1 y del nombre del perfil correcto en ambos.
+- Pruebas host correctas de NMEA/encaminamiento para los cuatro perfiles,
+  secuencia GPS V4.3 (cancelación, reinicio y desbordamiento de millis), ventana
+  MAX30102, recuperación FIFO/errores I2C y sensor deshabilitado en V3/V4.2/R8.
+- No se cargó ninguna placa automáticamente. Estas comprobaciones no validan
+  fijación GPS ni la comunicación física de la versión principal actualizada.
+
+## Base de la integración y perfiles
 
 Esta versión conserva el protocolo LoRa 5.1, los UUID BLE, el formato `M2:`
 AES-128-GCM y los nombres guardados. El cifrado sigue en el teléfono: el
@@ -6,11 +75,11 @@ repetidor transporta el contenido sin descifrarlo. No sustituye el proyecto
 por Meshtastic ni MeshCore.
 
 Abrir el sketch desde su carpeta completa: además de `firmware.ino`, necesita
-`board_profile.h`, `nmea_gps.h`, `routing_policy.h`, `max30102_sensor.h` y
+`board_profile.h`, `nmea_gps.h`, `gps_hardware.h`, `routing_policy.h`, `max30102_sensor.h` y
 `health_signal.h`. No copiar solamente el
 archivo `.ino` a otra carpeta.
 
-La base GPS descrita aquí corresponde a 5.2. La fuente actual 5.3 añade un
+La base GPS descrita aquí se introdujo en 5.2. Desde 5.3 se añade un
 MAX30102 opcional únicamente al perfil `V4_3`: ver [MAX30102_V4.md](MAX30102_V4.md).
 Los binarios anteriores 5.2 no contienen esa integración. Sus resultados de
 compilación anteriores no validan el firmware nuevo.
@@ -26,9 +95,8 @@ La frecuencia existente de MeshLink, 915 MHz, está dentro de la banda indicada
 del equipo y se conserva igual en V3 y V4. La configuración RF debe coincidir
 en todos los nodos; no se modifica automáticamente al cambiar de placa.
 
-El receptor GNSS exacto no se distingue en la captura. Los 9600 baudios son
-una configuración inicial que debe confirmarse con la etiqueta del receptor
-y los contadores NMEA. Comprobar también la serigrafía de las placas recibidas
+Las fotos posteriores identificaron un receptor Quectel L76K. El diagnóstico
+r2 confirmó 9600 baudios en el conjunto probado. Comprobar también la serigrafía de las placas recibidas
 antes de cargar: una captura del anuncio no sustituye la inspección del equipo.
 
 | Parámetro de compilación | Hardware | FEM | Vext | Alimentación GNSS |
@@ -45,11 +113,12 @@ placa recibida coincida con alguna variante específica.
 Los perfiles V4 de esta tabla corresponden a placas con el FEM indicado;
 no asumir que una variante de baja potencia sin amplificador es equivalente.
 
-La integración GNSS usa NMEA por UART (RMC/GGA, con checksum), inicialmente
-9600 baudios, RX del ESP32 en GPIO38 y TX en GPIO39. Está orientada al GPS
-UART del conector Heltec, como el L76K; no se ha verificado el receptor
-comprado. Los pines UART se pueden modificar mediante `MESH_GPS_RX_PIN` y
-`MESH_GPS_TX_PIN` en `board_profile.h`. Una pantalla TFT o un kit de expansión
+La integración GNSS usa NMEA por UART (RMC/GGA, con checksum) a 9600 baudios.
+En `V4_3`, RX del ESP32 es GPIO39 y TX está deshabilitado; `V4_2`/`V4_R8`
+conservan RX38/TX39 sin nueva validación física. Los pines se definen mediante
+`MESH_GPS_RX_PIN` y `MESH_GPS_TX_PIN` en `board_profile.h`; el perfil `V4_3`
+rechaza habilitar TX para evitar conducir la línea observada de salida GPS.
+Una pantalla TFT o un kit de expansión
 con conexiones distintas requiere su propio perfil; estos perfiles usan OLED.
 
 ## Mejoras incluidas
@@ -134,6 +203,11 @@ que ya está instalada en el teléfono.
 
 ## Diagnóstico y aceptación en hardware
 
+Si `bytes=0` persiste con dos GPS, hay un
+[diagnóstico aislado V4.3/4.3.1 + L76K](DIAGNOSTICO_GPS_L76K.md) para comprobar
+arranque, tráfico UART y velocidades sin LoRa/BLE. Cargarlo sustituye
+temporalmente MeshLink; leer la guía y la restauración antes de usarlo.
+
 Comandos serie: `gps`, `gps on`, `gps off`. `gps` informa estado y contadores,
 sin transmitir coordenadas por radio. Si `bytes=0`, revisar alimentación,
 receptor y RX/TX; si hay bytes pero no sentencias válidas, revisar baudios y
@@ -155,7 +229,7 @@ transmitir, y montar el GPS en el conector y orientación correctos.
 
 Las compilaciones y pruebas automatizadas no sustituyen esta validación física.
 
-## Comprobaciones de esta preparación
+## Comprobaciones históricas de la integración inicial (5.2)
 
 - Firmware final V3: compilación Arduino correcta con core Heltec 3.3.8
   y RadioLib 7.8.1; 764 935 bytes de programa y 33 092 bytes de RAM estática.

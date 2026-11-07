@@ -1,6 +1,7 @@
 # MAX30102 corrección FIFO r2 / diagnóstico BLE r3 — Heltec V4.3 / V4.3.1
 
-Fuente actual firmware 5.6.0, app 1.4.0. El arranque imprime
+Fuente actual firmware 5.6.1, app 1.4.2. La corrección 5.6.1 es de GPS,
+no cambia esta adquisición MAX30102. Ver [GPS](V4_GPS.md). El arranque imprime
 `[HEALTH-DIAG r3]`; `info` por BLE añade `healthDiagnosticRevision: 3`.
 Se conserva la recuperación r2; r3 agrega identidad de arranque y diagnóstico
 a las instantáneas BLE para [registro local y envío manual](MEDICIONES_MAX30102.md).
@@ -43,7 +44,7 @@ Desde PowerShell normal, cerrar el monitor serie y ejecutar:
 
 ```powershell
 cd "C:\Users\Yohamin\Documents\Codex\2026-08-08\u\MeshLink-LoRa-App"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-firmware.ps1 -Board V4_3 -Jobs 4 -ConfigFile "C:\Users\Yohamin\.arduinoIDE\arduino-cli.yaml" -OutputDirectory "C:\Users\Yohamin\Documents\Codex\2026-08-08\u\MeshLink-LoRa-App\firmware\build\V4_3-5.6.0" -Port COM4
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\firmware\build-firmware.ps1 -Board V4_3 -Jobs 4 -ConfigFile "C:\Users\Yohamin\.arduinoIDE\arduino-cli.yaml" -OutputDirectory "C:\Users\Yohamin\Documents\Codex\2026-08-08\u\MeshLink-LoRa-App\firmware\build\V4_3-5.6.1" -Port COM4
 ```
 
 Confirmar que la V4.3.1 sigue en COM4 antes de cargar. Omitir `-Port COM4`

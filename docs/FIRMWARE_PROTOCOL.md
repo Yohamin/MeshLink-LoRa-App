@@ -1,5 +1,13 @@
 # Firmware protocol 5.1
 
+## Firmware 5.6.1 GPS-only correction
+
+The tested V4_3 L76K kit now listens on ESP GPIO39 at 9600 baud with UART TX
+disabled, and sequences power/reset using weak control pull-ups without
+blocking delays. V3 behavior, wire protocol 5.1, BLE UUIDs and GPS response
+fields remain unchanged. App 1.4.1 does not need rebuilding for this fix.
+See [GPS correction and physical acceptance](V4_GPS.md).
+
 ## Optional 5.6 physiological snapshot extension
 
 Firmware 5.6.0 retains the r2 acquisition/FIFO recovery and radio protocol.

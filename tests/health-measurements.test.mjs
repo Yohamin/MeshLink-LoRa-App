@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { gcm } from '@noble/ciphers/aes.js';
 import { normalizeHealth } from '../src/lib/health.ts';
-import { HealthJournal, HEALTH_MAX_RECORDS, healthArchiveCsv } from '../src/lib/health-journal.ts';
+import { HealthJournal, HEALTH_MAX_RECORDS, HEALTH_CAPTURE_TARGET, healthArchiveCsv } from '../src/lib/health-journal.ts';
 import { createHealthShare, encodeHealthShare, decodeHealthShare, formatHealthShare, assertHealthTransport, declaredChoices, declaredLabels, healthShareRequestsHelp } from '../src/lib/health-share.ts';
 import { SerialTaskQueue } from '../src/lib/serial-task-queue.ts';
 import { metricPacket } from '../src/lib/telemetry.ts';
@@ -182,6 +182,102 @@ test('MAX sessions: bounded records close without automatic overwrite', async ()
   for (let i = 0; i < HEALTH_MAX_RECORDS; ++i) await journal.capture(health({ uptimeMs: 1000 + i * 1000 }, NOW + i * 1000), NOW + i * 1000);
   assert.equal(journal.activeId, null); assert.equal(journal.sessions[0].endReason, 'record_limit');
   assert.equal((await journal.archive(meta.id)).records.length, HEALTH_MAX_RECORDS);
+});
+
+test('MAX capture 100: invalid readings count, share events do not, queued captures cannot overrun', async () => {
+  const { store, journal } = await setup(); await journal.start({ ...meta, targetSamples: HEALTH_CAPTURE_TARGET });
+  const report = createHealthShare(health(), 'N', meta.id, NOW);
+  const share = { at: NOW, type: 'share', destination: 'N-B', report, requestId: 'target-share' };
+  await journal.logShare({ ...share, outcome: 'attempt' });
+  for (let i = 0; i < 99; ++i) {
+    const invalid = i % 2 === 0;
+    await journal.capture(health({ uptimeMs: 1000 + i * 1000, contact: !invalid,
+      state: invalid ? 'no_contact' : 'reading' }, NOW + i * 1000), NOW + i * 1000);
+  }
+  assert.equal(journal.sessions[0].records, 100);
+  assert.equal(journal.sessions[0].sampleCount, 99);
+  assert.equal(journal.activeId, meta.id);
+  const jobs = Array.from({ length: 5 }, (_, i) => journal.capture(health({ uptimeMs: 100000 + i * 1000 }, NOW + (99 + i) * 1000), NOW + (99 + i) * 1000));
+  await Promise.all(jobs);
+  await journal.logShare({ ...share, outcome: 'submitted' }, meta.id);
+  await journal.stop('screen_left');
+  const a = await journal.archive(meta.id);
+  assert.equal(journal.activeId, null);
+  assert.equal(a.session.endReason, 'sample_target_reached');
+  assert.equal(a.session.records, 102);
+  assert.equal(a.session.sampleCount, 100);
+  assert.deepEqual(a.summary, { sampleCount: 100, heartValidCount: 50, spo2ValidCount: 50, bothValidCount: 50,
+    targetSamples: 100, status: 'completed' });
+  assert.equal(a.records.filter(r => r.type === 'sample' && r.health.heartRateBpm === null).length, 50);
+  const restored = new HealthJournal(store); await restored.init();
+  assert.equal((await restored.archive(meta.id)).summary.status, 'completed');
+  assert.equal(restored.activeId, null);
+});
+
+test('MAX capture 100: manual and lifecycle interruptions retain partial count and never resume', async () => {
+  for (const reason of ['manual', 'screen_left', 'app_background', 'link_or_sensor_changed']) {
+    const { store, journal } = await setup(); await journal.start({ ...meta, targetSamples: 100 });
+    for (let i = 0; i < 63; ++i) await journal.capture(health({ uptimeMs: 1000 + i * 1000 }, NOW + i * 1000), NOW + i * 1000);
+    await journal.stop(reason, NOW + 63000);
+    await journal.capture(health({ uptimeMs: 64000 }));
+    const a = await journal.archive(meta.id);
+    assert.equal(a.session.sampleCount, 63); assert.equal(a.summary.status, 'interrupted');
+    assert.equal(a.session.endReason, reason);
+    const restored = new HealthJournal(store); await restored.init();
+    assert.equal(restored.activeId, null); assert.equal((await restored.archive(meta.id)).summary.sampleCount, 63);
+  }
+});
+
+test('MAX capture 100: final page/index failure preserves evidence without claiming completion', async () => {
+  for (const failure of ['page', 'index']) {
+    const { store, journal } = await setup(); await journal.start({ ...meta, targetSamples: 100 });
+    for (let i = 0; i < 99; ++i) await journal.capture(health({ uptimeMs: 1000 + i * 1000 }, NOW + i * 1000), NOW + i * 1000);
+    store.fail = k => failure === 'index' ? k.endsWith('/index') : k.endsWith('/3');
+    await assert.rejects(journal.capture(health({ uptimeMs: 100000 }, NOW + 99000), NOW + 99000), /disk full/);
+    const saved = failure === 'index' ? 100 : 99;
+    const rescue = await journal.archive(meta.id);
+    assert.equal(journal.activeId, null); assert.equal(rescue.summary.sampleCount, saved);
+    assert.equal(rescue.summary.status, 'interrupted');
+    store.fail = () => false;
+    const restored = new HealthJournal(store); await restored.init();
+    const recovered = await restored.archive(meta.id);
+    assert.equal(restored.activeId, null); assert.equal(recovered.summary.sampleCount, saved);
+    assert.equal(recovered.summary.status, 'interrupted');
+  }
+});
+
+test('MAX capture summaries: per-channel validity and CSV/JSON metadata preserve the denominator', async () => {
+  const { journal } = await setup(); await journal.start({ ...meta, targetSamples: 100 });
+  const packets = [{}, { heartRateValid: false }, { spo2Valid: false }, { contact: false }];
+  for (const [i, p] of packets.entries()) await journal.capture(health({ ...p, uptimeMs: 1000 + i * 1000 }, NOW + i * 1000), NOW + i * 1000);
+  await journal.stop(); const a = await journal.archive(meta.id);
+  assert.deepEqual(a.summary, { sampleCount: 4, heartValidCount: 2, spo2ValidCount: 2, bothValidCount: 1,
+    targetSamples: 100, status: 'interrupted' });
+  assert.deepEqual(JSON.parse(JSON.stringify(a)).summary, a.summary);
+  const csv = healthArchiveCsv(a);
+  const headers = csv.split('\r\n')[0].split(',');
+  const values = csv.split('\r\n').slice(1).map(line => line.split(','));
+  const field = name => headers.indexOf(`"${name}"`);
+  assert.ok(field('sampleIndex') >= 0);
+  assert.deepEqual(values.map(row => row[field('sampleIndex')]), ['"1"', '"2"', '"3"', '"4"']);
+  for (const row of values) {
+    assert.equal(row[field('targetSamples')], '"100"');
+    assert.equal(row[field('sessionSampleCount')], '"4"');
+    assert.equal(row[field('sessionStatus')], '"interrupted"');
+  }
+});
+
+test('MAX legacy histories: sample counts are recovered without imposing a target', async () => {
+  const { store, journal } = await setup(); await journal.start(meta);
+  await journal.capture(health()); await journal.capture(health({ uptimeMs: 2000 })); await journal.stop();
+  const index = JSON.parse(store.map.get('@meshlink/health-v1/index'));
+  delete index[0].sampleCount; delete index[0].targetSamples;
+  store.map.set('@meshlink/health-v1/index', JSON.stringify(index));
+  const restored = new HealthJournal(store); await restored.init();
+  const a = await restored.archive(meta.id);
+  assert.equal(restored.sessions[0].sampleCount, 2);
+  assert.equal(a.summary.targetSamples, null); assert.equal(a.summary.status, 'finished');
+  assert.equal(a.summary.sampleCount, 2); assert.equal(a.records.length, 2);
 });
 
 test('emergency support: only explicitly requested help is SOS, even without measurements', () => {

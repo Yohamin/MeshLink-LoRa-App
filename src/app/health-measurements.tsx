@@ -7,9 +7,20 @@ import { BROADCAST_ID, DEMO_NETWORK_KEY } from "@/constants/mesh";
 import { useMesh } from "@/context/mesh-context";
 import { useHealthMeasurements } from "@/context/health-measurements-context";
 import { healthStatusText, healthSupportReading } from "@/lib/health";
-import { HEALTH_MAX_RECORDS, healthArchiveCsv, type HealthArchive } from "@/lib/health-journal";
+import { HEALTH_MAX_RECORDS, HEALTH_CAPTURE_TARGET, healthArchiveCsv, type HealthArchive, type HealthSession } from "@/lib/health-journal";
 import { declaredChoices, declaredLabels, decodeHealthShare, formatHealthShare, type DeclaredCondition } from "@/lib/health-share";
 import { exportMetricFile } from "@/lib/metric-export";
+
+const captureStatus = (session: HealthSession) => {
+  const count = session.sampleCount ?? 0;
+  if (session.targetSamples !== undefined) {
+    const status = session.endedAt === null ? "En curso" : session.endReason === "sample_target_reached" && count === session.targetSamples
+      ? "Completada" : "Interrumpida";
+    return `${status}: ${count}/${session.targetSamples} instantáneas`;
+  }
+  return `${session.endedAt === null ? "En curso" : "Finalizada"}: ${count} instantáneas`;
+};
+const validCount = (count: number, total: number) => `${count}/${total}${total ? ` (${(count / total * 100).toFixed(1)} %)` : ""}`;
 
 export default function HealthMeasurementsScreen() {
   const mesh = useMesh(), measurement = useHealthMeasurements();
@@ -18,6 +29,7 @@ export default function HealthMeasurementsScreen() {
   const [archive, setArchive] = useState<HealthArchive | null>(null), [limit, setLimit] = useState(15);
   const [now, setNow] = useState(Date.now());
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [capture100, setCapture100] = useState(true);
   useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, []);
   const stop = useRef(measurement.stop); stop.current = measurement.stop;
   useFocusEffect(useCallback(() => () => { void stop.current("screen_left").catch(() => {}); }, []));
@@ -27,8 +39,8 @@ export default function HealthMeasurementsScreen() {
     try { await job(); } catch (e) { fail(e); } finally { setBusy(false); }
   };
   const start = () => Alert.alert("¿Guardar una sesión de medición?",
-    "Usa un alias o código de participante y su consentimiento. Se guardarán estimaciones, Rojo/IR, estados y errores en este teléfono, sin cifrado adicional en reposo. No hay diagnóstico ni envío automático. Salir de esta pantalla, perder BLE o bloquear el teléfono finaliza el registro; no se reanuda solo.",
-    [{ text: "Cancelar", style: "cancel" }, { text: "Guardar sesión", onPress: () => void action(() => measurement.start(label)) }]);
+    `${capture100 ? `Se guardarán ${HEALTH_CAPTURE_TARGET} instantáneas y el registro finalizará automáticamente. Cuentan también las lecturas inválidas; los eventos de envío no cuentan. ` : "El registro finalizará cuando lo detengas o alcance el límite de almacenamiento. "}Usa un alias o código de participante y su consentimiento. Se guardarán estimaciones, Rojo/IR, estados y errores en este teléfono, sin cifrado adicional en reposo. No hay diagnóstico ni envío automático. Salir de esta pantalla, perder BLE o bloquear el teléfono finaliza el registro; no se reanuda solo.`,
+    [{ text: "Cancelar", style: "cancel" }, { text: "Guardar sesión", onPress: () => void action(() => measurement.start(label, capture100 ? HEALTH_CAPTURE_TARGET : undefined)) }]);
   const share = () => {
     try {
       const proposal = measurement.proposal(declared), target = destination.trim();
@@ -50,6 +62,7 @@ export default function HealthMeasurementsScreen() {
     Alert.alert("Exportado", "El archivo contiene datos sensibles y no está cifrado. Compártelo solo con autorización. La sesión original sigue en la app.");
   });
   const h = mesh.health, reading = healthSupportReading(h, now), active = measurement.sessions.find(s => s.id === measurement.activeId);
+  const latestCapture = !active && measurement.sessions.at(-1)?.targetSamples !== undefined ? measurement.sessions.at(-1) : undefined;
   const secure = mesh.encryptionEnabled && mesh.networkKey !== DEMO_NETWORK_KEY && mesh.networkKey.trim().length >= 12;
   const shareDisabled = busy || !active || !secure || mesh.connectionState !== "connected" || !!measurement.error;
   const received = mesh.messages.filter(m => m.direction === "incoming" && decodeHealthShare(m.text)).slice(-10).reverse();
@@ -92,11 +105,18 @@ export default function HealthMeasurementsScreen() {
       <Text style={styles.heading}>3. Guardar el registro</Text>
       <TextInput accessibilityLabel="Alias de sesión" style={styles.input} placeholder="Código o alias del participante (opcional)" maxLength={60}
         editable={!active && !busy} value={label} onChangeText={setLabel} />
+      <View style={styles.row}><Text style={styles.copy}>Capturar {HEALTH_CAPTURE_TARGET} instantáneas</Text>
+        <Switch accessibilityLabel="Capturar 100 instantáneas con cierre automático" value={capture100} disabled={!!active || busy} onValueChange={setCapture100} /></View>
+      <Text style={styles.copy}>{capture100 ? "Cierre automático tras guardar la instantánea 100, incluidas las lecturas inválidas. Duración aproximada: 1 min 40 s, según la llegada de datos."
+        : "Registro manual: utiliza Finalizar registro para detenerlo."}</Text>
       <Text style={styles.copy}>Se guardan las instantáneas recibidas por BLE (~1/s), incluidos valores inválidos como ausentes, no como cero. No es la señal completa de 25 Hz. Máximo {HEALTH_MAX_RECORDS} registros por sesión. Mantén esta pantalla visible.</Text>
       <Text style={styles.small}>Inicia el registro para compartir desde este apartado, incluso si no hay lectura válida. Debes tener el sensor activado y un estado reciente del nodo. Finalizar el registro no apaga el sensor.</Text>
-      {active ? <><Text accessibilityLiveRegion="polite" style={styles.copy}>Guardando: {active.records} registros · {active.id}</Text>
+      {active ? <><Text accessibilityLiveRegion="polite" style={styles.copy}>{captureStatus(active)} · {active.id}</Text>
         <TouchableOpacity style={styles.stop} onPress={() => void measurement.stop().catch(fail)}><Text style={styles.white}>Finalizar registro / cancelar envío pendiente</Text></TouchableOpacity></> :
         <TouchableOpacity style={styles.button} disabled={busy || !measurement.ready || !!measurement.error} onPress={start}><Text style={styles.white}>Iniciar registro con consentimiento</Text></TouchableOpacity>}
+      {latestCapture && <><Text accessibilityLiveRegion="polite" style={styles.notice}>{captureStatus(latestCapture)}</Text>
+        <TouchableOpacity disabled={busy} onPress={() => void action(async () => setArchive(await measurement.archive(latestCapture.id)))}>
+          <Text style={styles.link}>Ver resumen de la última captura</Text></TouchableOpacity></>}
     </View>
     <View style={styles.card}>
       <Text style={styles.heading}>4. Comunicar y coordinar ayuda</Text>
@@ -117,11 +137,14 @@ export default function HealthMeasurementsScreen() {
     <Text style={styles.small}>No se borra al limpiar chats. Desinstalar o borrar datos de la app puede eliminarlo. Exportaciones sin cifrar; datos privados del participante.</Text>
     {[...measurement.sessions].reverse().slice(0, limit).map(s => <TouchableOpacity key={s.id} style={styles.card} disabled={busy}
       onPress={() => void action(async () => setArchive(await measurement.archive(s.id)))}>
-      <Text style={styles.heading}>{s.label}</Text><Text style={styles.copy}>{new Date(s.startedAt).toLocaleString()} · {s.records} registros{"\n"}{s.nodeId} · {s.endedAt === null ? "En curso" : `Finalizada: ${s.endReason}`}</Text>
+      <Text style={styles.heading}>{s.label}</Text><Text style={styles.copy}>{new Date(s.startedAt).toLocaleString()} · {s.records} registros{"\n"}{s.nodeId} · {captureStatus(s)}</Text>
       <Text style={styles.link}>Ver sesión y exportar</Text></TouchableOpacity>)}
     {measurement.sessions.length > limit && <TouchableOpacity onPress={() => setLimit(limit + 15)}><Text style={styles.link}>Mostrar más</Text></TouchableOpacity>}
     {archive && <View style={styles.card}><Text style={styles.heading}>Sesión {archive.session.id}</Text>
-      <Text style={styles.copy}>{archive.session.label} · {archive.records.filter(r => r.type === "sample").length} instantáneas{"\n"}{archive.coverage}</Text>
+      <Text style={styles.copy}>{archive.session.label} · {captureStatus(archive.session)}{"\n"}{archive.coverage}</Text>
+      <Text style={styles.copy}>Pulso válido: {validCount(archive.summary.heartValidCount, archive.summary.sampleCount)}{"\n"}
+        SpO₂ válida: {validCount(archive.summary.spo2ValidCount, archive.summary.sampleCount)}{"\n"}
+        Ambos válidos: {validCount(archive.summary.bothValidCount, archive.summary.sampleCount)}</Text>
       <TouchableOpacity style={styles.button} disabled={busy} onPress={() => Alert.alert("¿Exportar datos sensibles sin cifrar?", "El archivo contiene mediciones fisiológicas y el alias del participante.", [
         { text: "Cancelar", style: "cancel" }, { text: "CSV", onPress: () => exportFile("csv") }, { text: "JSON", onPress: () => exportFile("json") }])}><Text style={styles.white}>Exportar CSV o JSON</Text></TouchableOpacity>
       <TouchableOpacity style={styles.stop} disabled={busy || archive.session.id === measurement.activeId} onPress={() => Alert.alert("¿Borrar esta sesión local?", "No se borrarán archivos exportados ni informes enviados a los chats u otros teléfonos.", [

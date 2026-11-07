@@ -3,16 +3,35 @@ import { healthIsFresh } from "./health.ts";
 import { encodeHealthShare, type HealthShare } from "./health-share.ts";
 
 export const HEALTH_MAX_RECORDS = 1800;
+export const HEALTH_CAPTURE_TARGET = 100;
 const ROOT = "@meshlink/health-v1", PAGE = 32;
 type Store = { getItem(k: string): Promise<string | null>; setItem(k: string, v: string): Promise<unknown>; removeItem(k: string): Promise<unknown> };
 export type HealthSession = {
   id: string; label: string; nodeId: string; bootId: string; board: string; firmwareVersion: string;
   appVersion: string; diagnosticRevision: number; startedAt: number; endedAt: number | null;
   endReason: string; records: number; deleting?: boolean;
+  targetSamples?: typeof HEALTH_CAPTURE_TARGET; sampleCount?: number;
 };
 export type HealthRecord = { at: number; type: "sample"; health: NodeHealth } |
   { at: number; type: "share"; destination: string; report: HealthShare; outcome: "attempt" | "submitted" | "failed"; requestId: string };
-export type HealthArchive = { schema: 1; session: HealthSession; records: HealthRecord[]; coverage: string };
+export type HealthSummary = {
+  sampleCount: number; heartValidCount: number; spo2ValidCount: number; bothValidCount: number;
+  targetSamples: number | null; status: "recording" | "completed" | "interrupted" | "finished";
+};
+export type HealthArchive = { schema: 1; session: HealthSession; records: HealthRecord[]; coverage: string; summary: HealthSummary };
+export function summarizeHealthSession(session: HealthSession, records: HealthRecord[]): HealthSummary {
+  const samples = records.filter(r => r.type === "sample");
+  const heartValid = (r: Extract<HealthRecord, { type: "sample" }>) =>
+    r.health.heartRateValid && r.health.heartRateBpm !== null && Number.isFinite(r.health.heartRateBpm);
+  const spo2Valid = (r: Extract<HealthRecord, { type: "sample" }>) =>
+    r.health.spo2Valid && r.health.spo2Percent !== null && Number.isFinite(r.health.spo2Percent);
+  return { sampleCount: samples.length, heartValidCount: samples.filter(heartValid).length,
+    spo2ValidCount: samples.filter(spo2Valid).length, bothValidCount: samples.filter(r => heartValid(r) && spo2Valid(r)).length,
+    targetSamples: session.targetSamples ?? null,
+    status: session.endedAt === null ? "recording" : session.targetSamples !== undefined
+      ? session.endReason === "sample_target_reached" && samples.length === session.targetSamples ? "completed" : "interrupted"
+      : session.endReason === "manual" || session.endReason === "record_limit" ? "finished" : "interrupted" };
+}
 export class HealthJournal {
   sessions: HealthSession[] = [];
   activeId: string | null = null;
@@ -29,6 +48,8 @@ export class HealthJournal {
       if (this.error && !rescue) throw new Error(this.error);
       try { return await job(); }
       catch (e) {
+        const session = this.sessions.find(s => s.id === this.activeId);
+        if (session && session.endedAt === null) { session.endedAt = Date.now(); session.endReason = "recording_error"; }
         this.error = e instanceof Error ? e.message : String(e); this.activeId = null; this.changed(); throw e;
       }
     });
@@ -56,22 +77,25 @@ export class HealthJournal {
     const raw = await this.store.getItem(`${ROOT}/index`);
     const sessions = raw ? JSON.parse(raw) : [];
     if (!Array.isArray(sessions) || sessions.some(s => !s || !/^[A-F0-9]{12}$/.test(s.id) ||
-      !Number.isInteger(s.records) || s.records < 0 || s.records > HEALTH_MAX_RECORDS)) throw new Error("Índice de mediciones inválido.");
+      !Number.isInteger(s.records) || s.records < 0 || s.records > HEALTH_MAX_RECORDS ||
+      (s.targetSamples !== undefined && s.targetSamples !== HEALTH_CAPTURE_TARGET))) throw new Error("Índice de mediciones inválido.");
     this.sessions = sessions;
     for (const s of [...this.sessions]) {
       if (s.deleting) { await this.purge(s); continue; }
       const rows = await this.rows(s); s.records = rows.length;
+      s.sampleCount = rows.filter(r => r.type === "sample").length;
       if (s.endedAt === null) {
         s.endedAt = rows.at(-1)?.at ?? s.startedAt; s.endReason = "app_interrupted";
       }
     }
     await this.index(); this.ready = true; this.changed();
   }); }
-  start(meta: Omit<HealthSession, "records" | "endedAt" | "endReason">) { return this.enqueue(async () => {
+  start(meta: Omit<HealthSession, "records" | "sampleCount" | "endedAt" | "endReason">) { return this.enqueue(async () => {
     if (!this.ready || this.activeId) throw new Error("El registro no está listo o ya hay una sesión activa.");
     if (!/^[A-F0-9]{12}$/.test(meta.id) || !/^[A-Fa-f0-9]{16,32}$/.test(meta.bootId) || !meta.nodeId ||
-        this.sessions.some(s => s.id === meta.id)) throw new Error("No se pudo identificar una nueva sesión de medición.");
-    const s: HealthSession = { ...meta, label: meta.label.replace(/[\r\n\t]/g, " ").slice(0, 60), records: 0, endedAt: null, endReason: "" };
+        this.sessions.some(s => s.id === meta.id) ||
+        (meta.targetSamples !== undefined && meta.targetSamples !== HEALTH_CAPTURE_TARGET)) throw new Error("No se pudo identificar una nueva sesión de medición.");
+    const s: HealthSession = { ...meta, label: meta.label.replace(/[\r\n\t]/g, " ").slice(0, 60), records: 0, sampleCount: 0, endedAt: null, endReason: "" };
     this.sessions = [...this.sessions, s]; await this.index();
     this.lastUptime = -1; this.activeId = s.id; this.changed(); return s.id;
   }); }
@@ -88,17 +112,26 @@ export class HealthJournal {
     if (!Array.isArray(rows) || rows.length !== s.records % PAGE) throw new Error("El registro cambió; se detuvo para conservarlo.");
     rows.push(record);
     await this.store.setItem(key, JSON.stringify(rows)); // Commit page BEFORE index.
-    s.records++; await this.index();
-    if (s.records >= HEALTH_MAX_RECORDS) await this.close(s, "record_limit", record.at);
+    s.records++;
+    if (record.type === "sample") s.sampleCount = (s.sampleCount ?? 0) + 1;
+    // Close in the serialized write queue: later captures cannot exceed the target.
+    if (s.endedAt === null && record.type === "sample" && s.targetSamples !== undefined && s.sampleCount === s.targetSamples) {
+      await this.close(s, "sample_target_reached", record.at);
+    } else if (s.endedAt === null && s.records >= HEALTH_MAX_RECORDS) await this.close(s, "record_limit", record.at);
+    else await this.index();
   }
   private async close(s: HealthSession, reason: string, at: number) {
     if (this.activeId === s.id) this.activeId = null;
-    s.endedAt = at; s.endReason = reason; await this.index();
+    s.endedAt = at; s.endReason = reason;
+    try { await this.index(); }
+    catch (e) { s.endReason = "recording_error"; throw e; }
   }
   capture(h: NodeHealth, at = Date.now()): Promise<void> {
     const id = this.activeId;
     if (!id) return Promise.resolve();
     if (this.pending >= 8) {
+      const session = this.sessions.find(s => s.id === id);
+      if (session && session.endedAt === null) { session.endedAt = at; session.endReason = "recording_error"; }
       this.activeId = null; this.error = "Almacenamiento demasiado lento; registro detenido."; this.changed();
       return Promise.reject(new Error(this.error));
     }
@@ -139,7 +172,8 @@ export class HealthJournal {
     const s = this.sessions.find(s => s.id === id);
     if (!s || s.deleting) throw new Error("Sesión no disponible.");
     const records = await this.rows(s);
-    return { schema: 1, session: { ...s, records: records.length }, records,
+    const summary = summarizeHealthSession(s, records);
+    return { schema: 1, session: { ...s, records: records.length, sampleCount: summary.sampleCount }, records, summary,
       coverage: "Instantáneas BLE (~1 Hz), no señal completa de 25 Hz. Hora del teléfono no sincronizada. No diagnóstico médico. Sin recuperación de datos fuera de BLE." };
   }, true); }
   private async purge(s: HealthSession) {
@@ -160,7 +194,10 @@ const csvCell = (v: unknown) => {
 export function healthArchiveCsv(a: HealthArchive): string {
   const diagnostics = [...new Set(a.records.flatMap(r => r.type === "sample" ? Object.keys(r.health.diagnostics) : []))].sort();
   const base = ["sessionId", "label", "nodeId", "bootId", "board", "firmwareVersion", "appVersion", "diagnosticRevision", "atPhone", "type", "state", "heartBpm", "spo2Percent", "enabled", "present", "contact", "heartValid", "spo2Valid", "red", "infrared",
-    "windowSamples", "samplesReceived", "fifoResets", "i2cErrors", "uptimeMs", "ageMs", "sampleAgeMs", "lastFault", "lastI2cOperation", "declared", "destination", "shareOutcome", "measuredAtSender", "reference", "requestId"];
+    "windowSamples", "samplesReceived", "fifoResets", "i2cErrors", "uptimeMs", "ageMs", "sampleAgeMs", "lastFault", "lastI2cOperation", "declared", "destination", "shareOutcome", "measuredAtSender", "reference", "requestId",
+    "captureMode", "targetSamples", "sampleIndex", "sessionSampleCount", "sessionStatus", "sessionEndReason", "sessionStartedAt", "sessionEndedAt"];
+  const summary = summarizeHealthSession(a.session, a.records);
+  let sampleIndex = 0;
   const rows: unknown[][] = [base.concat(diagnostics)];
   for (const r of a.records) {
     const h = r.type === "sample" ? r.health : null;
@@ -172,6 +209,9 @@ export function healthArchiveCsv(a: HealthArchive): string {
       r.type === "share" ? r.report.declared : null, r.type === "share" ? r.destination : null,
       r.type === "share" ? r.outcome : null, r.type === "share" ? new Date(r.report.measuredAt).toISOString() : null,
       r.type === "share" ? r.report.reference : null, r.type === "share" ? r.requestId : null,
+      a.session.targetSamples === undefined ? "manual" : "target_samples", a.session.targetSamples,
+      r.type === "sample" ? ++sampleIndex : null, summary.sampleCount, summary.status, a.session.endReason,
+      new Date(a.session.startedAt).toISOString(), a.session.endedAt === null ? null : new Date(a.session.endedAt).toISOString(),
       ...diagnostics.map(k => h?.diagnostics[k])]);
   }
   return rows.map(row => row.map(csvCell).join(",")).join("\r\n");

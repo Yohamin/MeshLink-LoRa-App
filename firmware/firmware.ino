@@ -16,6 +16,7 @@
 #include <freertos/queue.h>
 #include "board_profile.h"
 #include "nmea_gps.h"
+#include "gps_hardware.h"
 #include "routing_policy.h"
 #include "max30102_sensor.h"
 
@@ -147,6 +148,10 @@ HardwareSerial gpsSerial(1);
 MeshGpsReader gpsReader;
 bool gpsEnabled = false;
 bool gpsUartReady = false;
+#if MESH_BOARD_PROFILE == 43
+MeshGpsPowerSequencer gpsHardware;
+bool gpsUartStartAttempted = false;
+#endif
 MeshMax30102 healthSensor;
 #if MESH_HAS_MAX30102
 bool healthDiagnosticSerial = false; // Explicit opt-in, OFF at boot.
@@ -1209,7 +1214,7 @@ void sendBleInfo() {
   doc["bleConnected"] = bleConnected;
   doc["layer"] = "5.1";
   doc["radio"] = "SX1262-RadioLib";
-  doc["firmwareVersion"] = "5.6.0";
+  doc["firmwareVersion"] = "5.6.1";
   doc["board"] = MESH_BOARD_NAME;
   doc["gpsSupported"] = bool(MESH_HAS_GPS);
   doc["healthSupported"] = bool(MESH_HAS_MAX30102);
@@ -2403,6 +2408,17 @@ void printHelp() {
 
 void pollGps() {
 #if MESH_HAS_GPS
+#if MESH_BOARD_PROFILE == 43
+  if (gpsEnabled && !gpsUartStartAttempted && gpsHardware.poll(millis())) {
+    gpsUartStartAttempted = true;
+    gpsSerial.setRxBufferSize(2048);
+    gpsSerial.begin(MESH_GPS_BAUD, SERIAL_8N1, MESH_GPS_RX_PIN, MESH_GPS_TX_PIN);
+    gpsUartReady = bool(gpsSerial);
+    Serial.printf("[GPS-UART r3] rx=%d tx=%d baud=%lu uart=%d controls=weak-pullup\n",
+      MESH_GPS_RX_PIN, MESH_GPS_TX_PIN, (unsigned long)MESH_GPS_BAUD, gpsUartReady);
+    if (!gpsUartReady) Serial.println("[GPS] UART no iniciada; revisar perfil. gps on permite reintentar.");
+  }
+#endif
   if (!gpsEnabled || !gpsUartReady) return;
   unsigned budget = 512;
   while (budget-- && gpsSerial.available()) gpsReader.feed(char(gpsSerial.read()), millis());
@@ -2413,6 +2429,15 @@ void setGpsEnabled(bool enabled) {
 #if MESH_HAS_GPS
   gpsEnabled = enabled;
   gpsReader.clearFix();
+#if MESH_BOARD_PROFILE == 43
+  if (gpsUartReady || gpsUartStartAttempted) gpsSerial.end();
+  gpsUartReady = false;
+  gpsUartStartAttempted = false;
+  pinMode(MESH_GPS_RX_PIN, INPUT);
+  gpsHardware.setEnabled(enabled, millis());
+  Serial.println(enabled ? "[GPS] Inicio r3 no bloqueante: OFF 600ms, ON 1000ms, RESET 250ms, espera 1200ms."
+                         : "[GPS] Apagado; UART detenida y controles sin pull-up.");
+#else
   if (gpsUartReady) gpsSerial.end();
   gpsUartReady = false;
   pinMode(MESH_GPS_POWER_PIN, OUTPUT);
@@ -2430,6 +2455,7 @@ void setGpsEnabled(bool enabled) {
     gpsSerial.begin(MESH_GPS_BAUD, SERIAL_8N1, MESH_GPS_RX_PIN, MESH_GPS_TX_PIN);
     gpsUartReady = true;
   }
+#endif
   prefs.putBool("gpsEnabled", enabled);
 #else
   gpsEnabled = false;
@@ -3058,7 +3084,7 @@ void setup() {
   Serial.println();
   Serial.println("=================================");
   Serial.println("CAPA 5.1 - BLE APP + MULTIHOP AUTOMATICO + ACK");
-  Serial.println(String("MeshLink 5.6.0 / RadioLib + ") + MESH_BOARD_NAME);
+  Serial.println(String("MeshLink 5.6.1 / RadioLib + ") + MESH_BOARD_NAME);
 #if MESH_HAS_MAX30102
   Serial.println("[HEALTH-DIAG r3] MAX30102 FIFO r2 + metadatos BLE para registro local; sin envio automatico LoRa");
 #endif

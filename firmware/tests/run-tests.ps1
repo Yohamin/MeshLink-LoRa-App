@@ -18,3 +18,11 @@ foreach ($profile in @(3, 42, 43, 48)) {
     & (Join-Path $buildRoot "gps-$profile.exe")
     if ($LASTEXITCODE -ne 0) { throw "Host tests failed for profile $profile." }
 }
+$hardwareSource = Join-Path $testRoot 'gps_hardware_test.cpp'
+$hardwareExe = Join-Path $buildRoot 'gps-hardware.exe'
+$hardwareObject = Join-Path $buildRoot 'gps-hardware.obj'
+$hardwareMocks = Join-Path $testRoot 'gps-mocks'
+& cmd.exe /d /c "call `"$devCmd`" -arch=x64 -no_logo >nul && cl /nologo /EHsc /std:c++17 /W4 /WX /DMESH_BOARD_PROFILE=43 /I`"$hardwareMocks`" `"$hardwareSource`" /Fe:`"$hardwareExe`" /Fo:`"$hardwareObject`""
+if ($LASTEXITCODE -ne 0) { throw 'GPS startup test compilation failed.' }
+& $hardwareExe
+if ($LASTEXITCODE -ne 0) { throw 'GPS startup tests failed.' }

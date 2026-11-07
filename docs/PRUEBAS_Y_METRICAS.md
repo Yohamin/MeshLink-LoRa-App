@@ -1,6 +1,10 @@
 # Ensayos coordinados: registro en emisor y receptor
 
-Fuente actual: app **1.3.0 / código Android 9** y firmware **5.5.0** para V3/V4.
+Base introducida en app **1.3.0 / código Android 9** y firmware **5.5.0**.
+Fuente actual: app **1.4.2 / código Android 12**, firmware **5.6.1** para V3/V4;
+ver [continuidad y estado de validación](continuidad/00_LEEME.md). Las
+limitaciones históricas de compilación del final no significan que la
+compilación nativa actual 5.6.1 haya fallado.
 Hay que compilar, instalar y probar ambos: editar la fuente no actualiza los
 APK/binarios anteriores. Se conserva el protocolo radio 5.1 y AES existente.
 

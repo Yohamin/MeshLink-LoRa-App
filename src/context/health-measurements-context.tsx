@@ -4,13 +4,13 @@ import Constants from "expo-constants";
 import React, { createContext, useContext, useEffect, useRef, useState } from "react";
 import { AppState } from "react-native";
 import { useMesh } from "./mesh-context";
-import { HealthJournal, type HealthArchive, type HealthSession } from "@/lib/health-journal";
+import { HealthJournal, HEALTH_CAPTURE_TARGET, type HealthArchive, type HealthSession } from "@/lib/health-journal";
 import { createHealthShare, encodeHealthShare, healthShareRequestsHelp, type DeclaredCondition, type HealthShare } from "@/lib/health-share";
 
 export type HealthProposal = { sessionId: string; nodeId: string; bootId: string; report: HealthShare; createdAt: number };
 type Value = {
   sessions: HealthSession[]; activeId: string | null; ready: boolean; error: string | null;
-  start: (label: string) => Promise<void>; stop: (reason?: string) => Promise<void>;
+  start: (label: string, targetSamples?: typeof HEALTH_CAPTURE_TARGET) => Promise<void>; stop: (reason?: string) => Promise<void>;
   archive: (id: string) => Promise<HealthArchive>; remove: (id: string) => Promise<void>;
   proposal: (declared: DeclaredCondition) => HealthProposal;
   share: (proposal: HealthProposal, destination: string) => Promise<void>;
@@ -55,7 +55,7 @@ export function HealthMeasurementsProvider({ children }: React.PropsWithChildren
       void stopRef.current("link_or_sensor_changed").catch(e => setOperationError(String(e)));
     }
   }, [journal, mesh.connectionState, mesh.nodeInfo, mesh.trialState.active, mesh.health?.enabled]);
-  const start = async (label: string) => {
+  const start = async (label: string, targetSamples?: typeof HEALTH_CAPTURE_TARGET) => {
     if (starting.current) throw new Error("Ya se está abriendo una sesión.");
     const m = current.current, h = m.health, n = m.nodeInfo, epoch = lifecycle.current;
     if (!foreground.current || m.connectionState !== "connected" || m.connectedDevice?.isDemo || m.trialState.active ||
@@ -68,7 +68,7 @@ export function HealthMeasurementsProvider({ children }: React.PropsWithChildren
       await journal.start({ id: Crypto.randomUUID().replace(/-/g, "").slice(0, 12).toUpperCase(),
         label: label || "Medición MAX30102", nodeId: n.nodeId, bootId: n.bootId, board: n.board ?? "",
         firmwareVersion: n.firmwareVersion ?? "", appVersion: Constants.expoConfig?.version ?? "unknown",
-        diagnosticRevision: h.diagnosticRevision, startedAt: Date.now() });
+        diagnosticRevision: h.diagnosticRevision, startedAt: Date.now(), ...(targetSamples === undefined ? {} : { targetSamples }) });
       const after = current.current;
       if (epoch !== lifecycle.current || !foreground.current || after.connectionState !== "connected" ||
           after.nodeInfo?.bootId !== n.bootId || after.nodeInfo?.nodeId !== n.nodeId) await journal.stop("start_interrupted");

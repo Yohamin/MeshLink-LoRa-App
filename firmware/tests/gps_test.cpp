@@ -59,8 +59,14 @@ int main() {
   static_assert(MESH_HAS_GPS == 0 && VEXT_PIN == 36 && MAX_NODES == 10, "V3 unchanged");
 #elif MESH_BOARD_PROFILE == 48
   static_assert(VEXT_PIN == 40 && MESH_GPS_POWER_PIN == 42 && MESH_GPS_WAKE_PIN == -1, "R8 pins");
+  static_assert(MESH_GPS_RX_PIN == 38 && MESH_GPS_TX_PIN == 39, "R8 UART unchanged");
 #else
   static_assert(VEXT_PIN == 36 && MESH_GPS_POWER_PIN == 34 && MESH_GPS_WAKE_PIN == 40, "R2 pins");
+#if MESH_BOARD_PROFILE == 43
+  static_assert(MESH_GPS_RX_PIN == 39 && MESH_GPS_TX_PIN == -1, "V4.3 observed RX39; never drive GPS TX");
+#else
+  static_assert(MESH_GPS_RX_PIN == 38 && MESH_GPS_TX_PIN == 39, "V4.2 UART unchanged");
+#endif
 #endif
   printf("GPS, routing and board profile %d: PASS\n", MESH_BOARD_PROFILE);
 }
